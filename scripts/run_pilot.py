@@ -277,6 +277,23 @@ def stage_submit(args: argparse.Namespace, sandbox: Path) -> list[Path]:
             run_dirs.append(run_dir)
             continue
 
+        # Safety: refuse to launch a real run on top of leftover response files
+        # (e.g., from a previous --dry-run). The download stage skips files that
+        # already exist, which would silently feed FAKE data into parse/analysis.
+        # Only allow leftovers if a real batch_tracking.json exists for them
+        # (idempotent resume of a real run).
+        responses_dir = run_dir / "responses"
+        leftover = sorted(responses_dir.glob("*")) if responses_dir.exists() else []
+        tracking_path = run_dir / "batch_tracking.json"
+        if leftover and not tracking_path.exists():
+            raise PilotError(
+                f"REFUSING to submit run{i}: {len(leftover)} response file(s) "
+                f"already exist in {responses_dir} but there is no "
+                f"batch_tracking.json. These are likely dry-run leftovers and "
+                f"would be silently consumed by the download stage. "
+                f"Delete {run_dir} (or the entire sandbox) and re-run."
+            )
+
         tracking_path = run_dir / "batch_tracking.json"
         if tracking_path.exists():
             with open(tracking_path) as f:

@@ -205,7 +205,7 @@ def build_openai_request(query, strategy, model_cfg, img_b64):
     body = {
         "model": model_cfg["model_id"],
         "temperature": model_cfg["temperature"],
-        "max_tokens": model_cfg["max_output_tokens"],
+        "max_completion_tokens": model_cfg["max_output_tokens"],
         "messages": [
             {"role": "system", "content": system_prompt},
             {
@@ -423,6 +423,39 @@ GOOGLE_CHUNK_SIZE = 100
 ANTHROPIC_CHUNK_SIZE = 100
 
 
+_OPENAI_TRANSIENT_HTTP = {401, 408, 429, 500, 502, 503, 504}
+
+
+def _openai_call_with_retries(fn, *args, _label="openai call", _max_attempts=4, **kwargs):
+    """
+    Retry wrapper for OpenAI HTTP calls. Retries on transient HTTP errors
+    (including 401, which we have observed as a transient OpenAI auth flake)
+    with exponential backoff: 2s, 4s, 8s. Re-raises after _max_attempts.
+    """
+    import urllib.error
+    last_err = None
+    for attempt in range(1, _max_attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except urllib.error.HTTPError as e:
+            if e.code not in _OPENAI_TRANSIENT_HTTP or attempt == _max_attempts:
+                raise
+            last_err = e
+            wait = 2 ** attempt
+            print(f"    {_label}: HTTP {e.code} on attempt {attempt}/{_max_attempts}; "
+                  f"retrying in {wait}s")
+            time.sleep(wait)
+        except (urllib.error.URLError, ConnectionError) as e:
+            if attempt == _max_attempts:
+                raise
+            last_err = e
+            wait = 2 ** attempt
+            print(f"    {_label}: {type(e).__name__} on attempt {attempt}/{_max_attempts}; "
+                  f"retrying in {wait}s")
+            time.sleep(wait)
+    raise last_err  # pragma: no cover (loop always returns or raises)
+
+
 def upload_openai_file(jsonl_path, api_key):
     """Upload a JSONL file to OpenAI and return the file ID."""
     import urllib.request
@@ -501,15 +534,16 @@ def submit_openai(queries, model_key, strategy, api_key):
                     req = build_openai_request(query, strategy, model_cfg, img_b64)
                     tmp.write(json.dumps(req) + "\n")
 
-            file_id = upload_openai_file(tmp_path, api_key)
+            file_id = _openai_call_with_retries(
+                upload_openai_file, tmp_path, api_key,
+                _label=f"upload chunk{chunk_num}")
             print(f"    Uploaded file: {file_id}")
-            batch_resp = create_openai_batch(file_id, model_key, api_key)
+            batch_resp = _openai_call_with_retries(
+                create_openai_batch, file_id, model_key, api_key,
+                _label=f"create batch chunk{chunk_num}")
             batch_id = batch_resp["id"]
             print(f"    Batch created: {batch_id}")
             batch_ids.append(batch_id)
-        except Exception as e:
-            print(f"    ERROR: {e}")
-            batch_ids.append(f"ERROR: {e}")
         finally:
             if tmp_path is not None and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
