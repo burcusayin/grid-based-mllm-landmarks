@@ -1378,5 +1378,29 @@ Commands:
     commands[args.command](args)
 
 
+def _load_dotenv_at_root() -> None:
+    """Load .env from project root if present (no python-dotenv dependency)."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):]
+            if "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                val = val[1:-1]
+            if key and key not in os.environ:
+                os.environ[key] = val
+
+
 if __name__ == "__main__":
+    _load_dotenv_at_root()
     main()

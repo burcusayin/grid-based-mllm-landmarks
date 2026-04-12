@@ -108,10 +108,44 @@ def run_pipeline(cmd: list[str], sandbox: Path, *, check: bool = True,
     return r
 
 
+def load_dotenv(path: Path) -> int:
+    """
+    Minimal .env loader (no dependency on python-dotenv).
+    Parses KEY=VALUE lines, ignores blanks and comments, strips matched
+    surrounding quotes. Existing os.environ values are NOT overwritten,
+    so a value already exported in the shell wins.
+    Returns the number of variables loaded.
+    """
+    if not path.exists():
+        return 0
+    n = 0
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):]
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = val
+            n += 1
+    return n
+
+
 def preflight(args: argparse.Namespace) -> None:
     """Fail early if anything is misconfigured."""
     log("Pre-flight checks", level="step")
     assert VENV_PY.exists(), f"missing venv at {VENV_PY}; run `python3 -m venv .venv` first"
+
+    loaded = load_dotenv(ROOT / ".env")
+    if loaded:
+        log(f"Loaded {loaded} variable(s) from .env", level="ok")
 
     # Parse models + validate
     import sys as _sys

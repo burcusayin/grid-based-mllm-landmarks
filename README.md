@@ -64,11 +64,19 @@ Schema is documented in `config.py` and validated by `pipeline.py` at parse time
 
 ## API keys
 
-See [SETUP_AND_COSTS.md](SETUP_AND_COSTS.md) for full instructions on creating accounts, enabling Batch APIs, and estimated cost. Minimum required to run the pilot:
+See [SETUP_AND_COSTS.md](SETUP_AND_COSTS.md) for full instructions on creating accounts, enabling Batch APIs, and estimated cost.
+
+The pipeline reads keys from `os.environ`. The recommended way is a `.env` file at the project root — both `pipeline.py` and `scripts/run_pilot.py` load it automatically (no `python-dotenv` dependency, just stdlib). `.env` is gitignored, so your keys never leave the machine.
+
+```bash
+cp .env.example .env
+# then open .env in your editor and paste your real keys
+```
+
+Minimum required for the default pilot is `OPENAI_API_KEY`. If you prefer the classic shell-export route, that still works and takes precedence over `.env`:
 
 ```bash
 export OPENAI_API_KEY=sk-...
-export GOOGLE_API_KEY=...        # optional for GPT-only pilot
 ```
 
 ## Run the pilot (recommended first)
