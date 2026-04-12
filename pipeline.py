@@ -818,12 +818,18 @@ def cmd_status(args):
                 for batch_id in info.get("batch_ids", []):
                     if batch_id.startswith("ERROR"):
                         continue
-                    req = urllib.request.Request(
-                        f"https://api.openai.com/v1/batches/{batch_id}",
-                        headers={"Authorization": f"Bearer {api_key}"},
-                    )
-                    with urllib.request.urlopen(req) as resp:
-                        batch_resp = json.loads(resp.read())
+
+                    def _poll_openai_batch():
+                        req = urllib.request.Request(
+                            f"https://api.openai.com/v1/batches/{batch_id}",
+                            headers={"Authorization": f"Bearer {api_key}"},
+                        )
+                        with urllib.request.urlopen(req) as resp:
+                            return json.loads(resp.read())
+
+                    batch_resp = _openai_call_with_retries(
+                        _poll_openai_batch,
+                        _label=f"poll {batch_name}/{batch_id[:20]}")
 
                     b_status = batch_resp["status"]
                     counts = batch_resp.get("request_counts", {})
@@ -851,15 +857,20 @@ def cmd_status(args):
             try:
                 api_key = config.get_api_key("anthropic")
                 for batch_id in info.get("batch_ids", []):
-                    req = urllib.request.Request(
-                        f"https://api.anthropic.com/v1/messages/batches/{batch_id}",
-                        headers={
-                            "x-api-key": api_key,
-                            "anthropic-version": "2023-06-01",
-                        },
-                    )
-                    with urllib.request.urlopen(req) as resp:
-                        batch_resp = json.loads(resp.read())
+                    def _poll_anthropic_batch():
+                        req = urllib.request.Request(
+                            f"https://api.anthropic.com/v1/messages/batches/{batch_id}",
+                            headers={
+                                "x-api-key": api_key,
+                                "anthropic-version": "2023-06-01",
+                            },
+                        )
+                        with urllib.request.urlopen(req) as resp:
+                            return json.loads(resp.read())
+
+                    batch_resp = _openai_call_with_retries(
+                        _poll_anthropic_batch,
+                        _label=f"poll {batch_name}/{batch_id[:20]}")
                     b_status = batch_resp.get("processing_status", "unknown")
                     if b_status == "ended":
                         info["status"] = "ended"
@@ -902,14 +913,19 @@ def cmd_download(args):
                     print(f"{batch_name} chunk {i}: Already downloaded")
                     continue
 
-                try:
+                def _dl_openai_chunk():
                     api_key = config.get_api_key("openai")
                     req = urllib.request.Request(
                         f"https://api.openai.com/v1/files/{file_id}/content",
                         headers={"Authorization": f"Bearer {api_key}"},
                     )
                     with urllib.request.urlopen(req) as resp:
-                        data = resp.read()
+                        return resp.read()
+
+                try:
+                    data = _openai_call_with_retries(
+                        _dl_openai_chunk,
+                        _label=f"download {batch_name} chunk {i}")
                     with open(out_path, "wb") as f:
                         f.write(data)
                     print(f"{batch_name} chunk {i}: Downloaded to {out_path}")
@@ -923,7 +939,7 @@ def cmd_download(args):
                     print(f"{batch_name}: Already downloaded")
                     continue
 
-                try:
+                def _dl_anthropic():
                     api_key = config.get_api_key("anthropic")
                     req = urllib.request.Request(
                         f"https://api.anthropic.com/v1/messages/batches/{batch_id}/results",
@@ -933,7 +949,12 @@ def cmd_download(args):
                         },
                     )
                     with urllib.request.urlopen(req) as resp:
-                        data = resp.read()
+                        return resp.read()
+
+                try:
+                    data = _openai_call_with_retries(
+                        _dl_anthropic,
+                        _label=f"download {batch_name}")
                     with open(out_path, "wb") as f:
                         f.write(data)
                     print(f"{batch_name}: Downloaded to {out_path}")
