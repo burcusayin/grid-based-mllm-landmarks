@@ -171,14 +171,16 @@ SYSTEM_PROMPT = (
 # Strategy 1: Zero-Shot Baseline
 ZERO_SHOT_POINT_TEMPLATE = (
     "This image is overlaid with a {cols}x{rows} square grid. "
-    "{fdi_prefix}{Identify} the coordinate of the cell (e.g., B3) containing {landmark_description}. "
+    "{fdi_prefix}{Identify} the coordinate of the cell containing {landmark_description}. "
+    "Respond with a single coordinate formatted as a row letter followed by a column number "
+    "(no spaces, no punctuation). "
     "Provide only the coordinate in your response."
 )
 
 ZERO_SHOT_AREA_TEMPLATE = (
     "This image is overlaid with a {cols}x{rows} square grid. "
     "{fdi_prefix}{Identify} {landmark_description}. "
-    "List all cells separated by commas (e.g., C4, D5, E6). "
+    "List all cells separated by commas, each formatted as a row letter followed by a column number. "
     "Provide only the coordinates in your response."
 )
 
@@ -186,8 +188,8 @@ ZERO_SHOT_AREA_TEMPLATE = (
 GUIDED_SYSTEM_ADDITION = (
     "The image has a grid overlay with columns numbered 1 through {cols} from left to right, "
     "and rows labeled A through {max_row} from top to bottom. "
-    "Each cell is identified by its row letter followed by its column number. "
-    "For example, A1 is the top-left cell and {max_row}{cols} is the bottom-right cell. "
+    "Each cell is identified by its row letter followed by its column number, "
+    "with no space or punctuation between them. "
     "The grid lines are drawn in cyan and labels are in yellow. "
     "For point-based questions, respond with exactly one cell coordinate. "
     "For area-based questions, list all cells the structure occupies, separated by commas."
