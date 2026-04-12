@@ -1,0 +1,16 @@
+# Dental MLLM Benchmark — pinned dependencies for reproducibility.
+#
+# Exact versions captured from the reference environment on 2026-04-12.
+# If you need to upgrade, regenerate this file from the venv AFTER
+# re-running tests/smoke_e2e.py and confirming all outputs match.
+#
+# Python: 3.14 (see tests/smoke_e2e.py and the venv at .venv/)
+
+openpyxl==3.1.5
+scipy==1.17.1
+matplotlib==3.10.8
+scikit-posthocs==0.12.0
+numpy==2.4.4
+pandas==3.0.2
+Pillow==12.2.0
+python-docx==1.2.0

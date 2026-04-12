@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRIVATE / SENSITIVE — never commit
+# ─────────────────────────────────────────────────────────────────────────────
+# Benchmark data: expert annotations, student responses, images. Remains
+# strictly on the researcher's machine. Integrity of the dataset is instead
+# tracked out-of-band via per-file SHA-256 captured in
+# reproducibility_manifest.json (also gitignored but regenerable).
+data/
+
+# Research documents: draft paper, colleague feedback, ethics/SOTA reports,
+# third-party atlases and reference PDFs. These contain private correspondence
+# and/or third-party copyrighted material; they must not be published via git.
+docs/
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Generated artefacts (regenerable from the source via `pipeline.py prepare`)
+results/
+results_pilot/
+results_pilot_*/
+
+# Test sandbox
+tests/.smoke_sandbox/
+tests/.smoke_sandbox_*/
+
+# Manifest is regenerable by scripts/reproducibility_manifest.py
+reproducibility_manifest.json
+
+# Secrets and local overrides
+.env
+.env.local
+*.key
+*.pem
+api_keys.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
