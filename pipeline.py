@@ -666,6 +666,12 @@ def submit_anthropic(queries, model_key, strategy, api_key):
 
 def cmd_submit(args):
     """Submit batches for all active models × strategies."""
+    # Safety gate: .api_lock prevents accidental API spend
+    api_lock = Path(__file__).resolve().parent / ".api_lock"
+    if api_lock.exists():
+        print("ERROR: API calls are locked. Delete .api_lock to unlock.")
+        sys.exit(1)
+
     # Load query index
     index_path = config.RESULTS_DIR / "query_index.json"
     if not index_path.exists():

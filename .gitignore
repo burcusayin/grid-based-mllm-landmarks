@@ -43,6 +43,9 @@ reproducibility_manifest.json
 *.pem
 api_keys.json
 
+# Safety lock
+.api_lock
+
 # IDE
 .idea/
 .vscode/

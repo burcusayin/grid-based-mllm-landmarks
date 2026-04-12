@@ -134,3 +134,11 @@ results/
       scatter_jaccard_dice.png
       boxplot_ed_by_modality.png
 ```
+
+---
+
+## 6. Known Issues
+
+- **Bug A (fixed in 933b3d4):** GPT-5.4 rejects the `max_tokens` parameter; the pipeline now uses `max_completion_tokens` for OpenAI requests.
+- **Bug E (pending fix):** Prompt template examples overlap with 10.1% of ground truths (91/900 queries). Fixed example coordinates (e.g., `B3`, `C4, D5, E6`) in `ZERO_SHOT_POINT_TEMPLATE`, `ZERO_SHOT_AREA_TEMPLATE`, and `GUIDED_SYSTEM_ADDITION` coincidentally match ground-truth values for some queries, creating a potential bias. A proposed fix replaces concrete examples with abstract format descriptions. Pending colleague approval.
+- **Note:** All prompt template changes require colleague sign-off before deployment.

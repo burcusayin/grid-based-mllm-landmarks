@@ -141,6 +141,14 @@ def load_dotenv(path: Path) -> int:
 def preflight(args: argparse.Namespace) -> None:
     """Fail early if anything is misconfigured."""
     log("Pre-flight checks", level="step")
+
+    # Safety gate: .api_lock prevents accidental API spend
+    api_lock = ROOT / ".api_lock"
+    if api_lock.exists() and not args.dry_run:
+        raise PilotError(
+            "API calls are locked. Delete .api_lock to unlock, or use --dry-run."
+        )
+
     assert VENV_PY.exists(), f"missing venv at {VENV_PY}; run `python3 -m venv .venv` first"
 
     loaded = load_dotenv(ROOT / ".env")
