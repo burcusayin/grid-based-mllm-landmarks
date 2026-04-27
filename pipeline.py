@@ -149,9 +149,11 @@ def generate_prompt(query, strategy):
             )
 
     elif strategy == "guided":
+        modality_clause = config.GUIDED_MODALITY_CLAUSES.get(sheet, "")
         grid_explanation = config.GUIDED_SYSTEM_ADDITION.format(
             cols=grid["cols"],
             max_row=grid["max_row_letter"],
+            modality_clause=modality_clause,
         )
         system_prompt = config.SYSTEM_PROMPT + "\n\n" + grid_explanation
 

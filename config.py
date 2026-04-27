@@ -191,9 +191,21 @@ GUIDED_SYSTEM_ADDITION = (
     "Each cell is identified by its row letter followed by its column number, "
     "with no space or punctuation between them. "
     "The grid lines are drawn in cyan and labels are in yellow. "
+    "{modality_clause}"
     "For point-based questions, respond with exactly one cell coordinate. "
     "For area-based questions, list all cells the structure occupies, separated by commas."
 )
+
+# Modality-specific clinical clauses injected into GUIDED_SYSTEM_ADDITION via
+# {modality_clause}. Empty string for modalities without a specific note.
+GUIDED_MODALITY_CLAUSES = {
+    "PANORAMIC": (
+        "In panoramic radiographs, the patient's right side appears on the left side of "
+        "the image, and the patient's left side appears on the right side of the image. "
+    ),
+    "PERIAPICAL": "",
+    "CEPHALOMETRIC": "",
+}
 
 GUIDED_POINT_TEMPLATE = (
     "{fdi_prefix}{Identify} the coordinate of the cell containing {landmark_description}. "
