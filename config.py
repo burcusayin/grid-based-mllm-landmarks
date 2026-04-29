@@ -29,6 +29,20 @@ if _RESULTS_ENV:
 else:
     RESULTS_DIR = PROJECT_ROOT / "results"
 
+# Hard refusal: RESULTS_DIR must NEVER coincide with or live inside DATA_DIR.
+# This protects the raw benchmark data (Excel + images) from any possible
+# write contamination, no matter what the env var or CLI flags say. Triggers
+# at import time so every entry point (pipeline.py, analysis.py, run_pilot.py,
+# tests, scripts) is covered uniformly.
+_data_resolved = DATA_DIR.resolve()
+_results_resolved = RESULTS_DIR.resolve()
+if _results_resolved == _data_resolved or _data_resolved in _results_resolved.parents:
+    raise RuntimeError(
+        f"REFUSING to use {_results_resolved} as RESULTS_DIR — it is the raw "
+        f"benchmark data directory ({_data_resolved}) or lives inside it. "
+        f"Pick a sandbox outside data/ (e.g. results/ or results_pilot_v2/)."
+    )
+
 BATCH_DIR = RESULTS_DIR / "batches"
 RESPONSES_DIR = RESULTS_DIR / "responses"
 ANALYSIS_DIR = RESULTS_DIR / "analysis"
