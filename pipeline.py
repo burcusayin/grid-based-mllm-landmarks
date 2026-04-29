@@ -812,47 +812,90 @@ def cmd_status(args):
         if provider == "openai":
             try:
                 api_key = config.get_api_key("openai")
-                all_completed = True
-                completed_count = 0
-                total_count = 0
-                output_file_ids = []
+            except Exception as e:
+                # Bundle-level error (config / auth) — surface and skip this bundle
+                print(f"{batch_name:<40} {provider:<12} {'error':<15} {e}",
+                      file=sys.stderr)
+                continue
 
-                for batch_id in info.get("batch_ids", []):
-                    if batch_id.startswith("ERROR"):
-                        continue
+            # Per-chunk progress is preserved across polls so a transient
+            # failure on one chunk does not reset the others, and successful
+            # chunks are not re-polled unnecessarily.
+            chunk_progress = info.setdefault("chunk_progress", {})
+            chunk_errors = []
+            completed_count = 0
+            total_count = 0
 
-                    def _poll_openai_batch():
-                        req = urllib.request.Request(
-                            f"https://api.openai.com/v1/batches/{batch_id}",
-                            headers={"Authorization": f"Bearer {api_key}"},
-                        )
-                        with urllib.request.urlopen(req) as resp:
-                            return json.loads(resp.read())
+            for batch_id in info.get("batch_ids", []):
+                if batch_id.startswith("ERROR"):
+                    continue
 
+                # If this chunk is already known-completed with an output file,
+                # trust the previous record and skip the API call.
+                prev = chunk_progress.get(batch_id, {})
+                if prev.get("status") == "completed" and prev.get("output_file_id"):
+                    completed_count += prev.get("completed_requests", 0)
+                    total_count += prev.get("total_requests", 0)
+                    continue
+
+                def _poll_openai_batch(_bid=batch_id):
+                    req = urllib.request.Request(
+                        f"https://api.openai.com/v1/batches/{_bid}",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                    )
+                    with urllib.request.urlopen(req) as resp:
+                        return json.loads(resp.read())
+
+                # Per-chunk error handling: log and continue with siblings
+                # rather than aborting the whole bundle's status update.
+                try:
                     batch_resp = _openai_call_with_retries(
                         _poll_openai_batch,
                         _label=f"poll {batch_name}/{batch_id[:20]}")
+                except Exception as e:
+                    msg = f"chunk {batch_id[:20]}: {type(e).__name__}: {e}"
+                    chunk_errors.append(msg)
+                    print(f"{batch_name:<40} {provider:<12} {'chunk-error':<15} {msg}",
+                          file=sys.stderr)
+                    continue
 
-                    b_status = batch_resp["status"]
-                    counts = batch_resp.get("request_counts", {})
-                    completed_count += counts.get("completed", 0)
-                    total_count += counts.get("total", 0)
+                b_status = batch_resp.get("status", "unknown")
+                counts = batch_resp.get("request_counts", {}) or {}
+                cc = counts.get("completed", 0)
+                tc = counts.get("total", 0)
+                completed_count += cc
+                total_count += tc
 
-                    if b_status != "completed":
-                        all_completed = False
-                    if batch_resp.get("output_file_id"):
-                        output_file_ids.append(batch_resp["output_file_id"])
+                # Record per-chunk progress so subsequent polls do not lose
+                # this information if the next poll hits a transient failure.
+                chunk_progress[batch_id] = {
+                    "status": b_status,
+                    "output_file_id": batch_resp.get("output_file_id"),
+                    "completed_requests": cc,
+                    "total_requests": tc,
+                }
 
-                if all_completed and output_file_ids:
-                    info["status"] = "completed"
-                    info["output_file_ids"] = output_file_ids
+            # Aggregate bundle status: completed only when every active chunk
+            # has been recorded as completed AND has an output_file_id.
+            active_ids = [bid for bid in info.get("batch_ids", [])
+                          if not bid.startswith("ERROR")]
+            all_completed = active_ids and all(
+                chunk_progress.get(bid, {}).get("status") == "completed"
+                and chunk_progress.get(bid, {}).get("output_file_id")
+                for bid in active_ids
+            )
+            if all_completed:
+                info["status"] = "completed"
+                # Preserve original chunk order for downstream download logic.
+                info["output_file_ids"] = [
+                    chunk_progress[bid]["output_file_id"] for bid in active_ids
+                ]
 
-                details = f"{completed_count}/{total_count} requests"
-                status = "completed" if all_completed else "in_progress"
-                print(f"{batch_name:<40} {provider:<12} {status:<15} {details}")
-
-            except Exception as e:
-                print(f"{batch_name:<40} {provider:<12} {'error':<15} {e}")
+            details = f"{completed_count}/{total_count} requests"
+            if chunk_errors:
+                details += f" ({len(chunk_errors)} chunk error(s) — will retry)"
+            status_label = "completed" if all_completed else "in_progress"
+            print(f"{batch_name:<40} {provider:<12} {status_label:<15} {details}")
 
         # Check Anthropic batch status
         elif provider == "anthropic":

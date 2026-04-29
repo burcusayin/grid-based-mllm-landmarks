@@ -100,6 +100,13 @@ def run_pipeline(cmd: list[str], sandbox: Path, *, check: bool = True,
         cmd, cwd=str(ROOT), env=env,
         capture_output=capture, text=True,
     )
+    # Surface non-empty stderr from captured subprocesses so transient failures
+    # (e.g. per-chunk OpenAI errors during cmd_status) are visible in the
+    # orchestrator log instead of being silently discarded.
+    if capture and r.stderr and r.stderr.strip():
+        log(f"subprocess stderr from {cmd[-1] if cmd else '?'}:", level="warn")
+        for line in r.stderr.rstrip().splitlines():
+            print(f"    {line}")
     if check and r.returncode != 0:
         if capture:
             print(r.stdout)
@@ -204,6 +211,18 @@ def stage_setup(args: argparse.Namespace) -> Path:
     sandbox.mkdir(parents=True, exist_ok=True)
 
     master_index = sandbox / "query_index.json"
+    # Sandboxes that contain a v1_reference.json are paired-comparison sandboxes
+    # whose query_index is cryptographically anchored to a sibling pilot run.
+    # Regenerating it would invalidate the pairing silently. Refuse outright.
+    v1_ref = sandbox / "v1_reference.json"
+    if v1_ref.exists() and args.force_prepare:
+        raise PilotError(
+            f"REFUSING --force-prepare on {sandbox}: this sandbox is a "
+            f"paired-comparison run (v1_reference.json present) and its "
+            f"query_index.json is hash-anchored to a sibling pilot. "
+            f"Regenerating it would silently break the pairing. Remove "
+            f"v1_reference.json first if you really mean to."
+        )
     if master_index.exists() and not args.force_prepare:
         log(f"Master query_index already exists at {master_index} — reusing "
             f"(use --force-prepare to regenerate)", level="ok")
