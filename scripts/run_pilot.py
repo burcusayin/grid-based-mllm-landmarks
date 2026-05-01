@@ -85,7 +85,8 @@ class PilotError(RuntimeError):
 
 def log(msg: str, *, level: str = "info") -> None:
     prefix = {"info": "ℹ", "ok": "✓", "warn": "⚠", "err": "✗", "step": "»"}[level]
-    print(f"{prefix} {msg}", flush=True)
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {prefix} {msg}", flush=True)
 
 
 def run_pipeline(cmd: list[str], sandbox: Path, *, check: bool = True,
@@ -485,6 +486,38 @@ def stage_summary(args: argparse.Namespace, sandbox: Path, run_dirs: list[Path])
     print("PILOT SUMMARY")
     print("=" * 70)
 
+    # Data-completeness check FIRST — surface partial-data risk before stats
+    expected_per_run = None
+    for run_dir in run_dirs:
+        qi_path = run_dir / "query_index.json"
+        if qi_path.exists():
+            n_queries = len(json.loads(qi_path.read_text()))
+            expected_per_run = n_queries * len(args._models) * 2  # 2 strategies
+            break
+    if expected_per_run is not None:
+        print()
+        print(f"Expected records per run: {expected_per_run} "
+              f"(queries × models × strategies)")
+        any_incomplete = False
+        for run_dir in run_dirs:
+            cs_path = run_dir / "compliance_stats.json"
+            if not cs_path.exists():
+                continue
+            cs = json.loads(cs_path.read_text())
+            actual = cs.get("total", 0)
+            if actual < expected_per_run:
+                any_incomplete = True
+                missing = expected_per_run - actual
+                print(f"  ⚠ {run_dir.name}: {actual}/{expected_per_run} parsed — "
+                      f"{missing} records missing ({100*missing/expected_per_run:.1f}%)")
+        if any_incomplete:
+            print()
+            print("⚠ DATA INCOMPLETE: at least one run is missing records.")
+            print("  Causes: failed downloads, OpenAI batch failures, or")
+            print("  parse errors. Investigate before trusting the analysis.")
+        else:
+            print(f"  ✓ All runs complete: {expected_per_run} records each")
+
     # Compliance per run
     for run_dir in run_dirs:
         cs_path = run_dir / "compliance_stats.json"
@@ -562,7 +595,21 @@ def main() -> None:
         sys.exit(2)
     except KeyboardInterrupt:
         log("interrupted — rerun the script to resume", level="warn")
+        log("WARNING: pending OpenAI batches continue processing in the cloud "
+            "and will still be billed. Manually cancel via OpenAI API if needed.",
+            level="warn")
         sys.exit(130)
+    finally:
+        # Auto-relock the API after any termination (success, error, or
+        # interrupt). This ensures a subsequent invocation will refuse to
+        # spend money without explicit unlock. Skip on dry-run.
+        if not args.dry_run:
+            api_lock = ROOT / ".api_lock"
+            if not api_lock.exists():
+                api_lock.write_text(
+                    "API calls are locked. Delete this file to unlock real API submissions.\n"
+                )
+                log(f"API lock re-created at {api_lock}", level="ok")
 
 
 if __name__ == "__main__":

@@ -509,8 +509,16 @@ def create_openai_batch(file_id, model_key, api_key):
         return json.loads(resp.read())
 
 
-def submit_openai(queries, model_key, strategy, api_key):
-    """Submit queries to OpenAI Batch API in chunks."""
+def submit_openai(queries, model_key, strategy, api_key, *,
+                   on_chunk_success=None):
+    """
+    Submit queries to OpenAI Batch API in chunks.
+
+    on_chunk_success: optional callback(chunk_num, batch_id) invoked after
+    each chunk's batch is successfully created at OpenAI. The caller can use
+    this to persist partial state to disk between chunks, so that a crash
+    mid-bundle does not strand already-created batch_ids without tracking.
+    """
     model_cfg = config.MODELS[model_key]
     img_cache = ImageCache()
     batch_ids = []
@@ -546,6 +554,17 @@ def submit_openai(queries, model_key, strategy, api_key):
             batch_id = batch_resp["id"]
             print(f"    Batch created: {batch_id}")
             batch_ids.append(batch_id)
+
+            # Persist partial state immediately so a later-chunk crash does
+            # not strand earlier chunks' batch_ids.
+            if on_chunk_success is not None:
+                try:
+                    on_chunk_success(chunk_num, batch_id, list(batch_ids))
+                except Exception as cb_err:
+                    # Persistence failure should not lose the chunk; warn but
+                    # continue. The caller will see the partial state on resume.
+                    print(f"    WARN: on_chunk_success callback failed: {cb_err}",
+                          file=sys.stderr)
         finally:
             if tmp_path is not None and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -723,9 +742,22 @@ def cmd_submit(args):
         for strategy in config.STRATEGIES:
             batch_name = f"{model_key}_{strategy}"
 
-            if batch_name in tracking and tracking[batch_name].get("status") not in ("failed",):
+            # Skip if this bundle has already been fully submitted. "partial"
+            # status (some chunks created at OpenAI but submission did not
+            # complete) is treated like "failed" — we re-submit the whole bundle.
+            # The orphaned partial batches at OpenAI will continue processing;
+            # operator should manually cancel them if needed.
+            existing_status = tracking.get(batch_name, {}).get("status")
+            if batch_name in tracking and existing_status not in ("failed", "partial"):
                 print(f"\nSKIP: {batch_name} already submitted")
                 continue
+            if existing_status == "partial":
+                stranded = tracking[batch_name].get("batch_ids", [])
+                print(f"\nWARN: {batch_name} previously crashed mid-submit; "
+                      f"{len(stranded)} stranded batch(es) at OpenAI:")
+                for bid in stranded:
+                    print(f"  {bid}  (consider manual cancel via API)")
+                print(f"  Re-submitting full bundle.")
 
             print(f"\n{'='*60}")
             print(f"Submitting: {batch_name} ({provider}, {len(queries)} queries)")
@@ -733,7 +765,24 @@ def cmd_submit(args):
 
             try:
                 if provider == "openai":
-                    batch_ids = submit_openai(queries, model_key, strategy, api_key)
+                    # Per-chunk persistence: if submit_openai crashes mid-bundle,
+                    # we still keep the batch_ids of chunks that successfully
+                    # made it to OpenAI. This prevents stranding (and being
+                    # billed for) orphaned batches with no local record.
+                    def _persist_chunk(chunk_num, batch_id, batch_ids_so_far):
+                        tracking[batch_name] = {
+                            "provider": provider,
+                            "batch_ids": list(batch_ids_so_far),
+                            "status": "partial",  # not yet "submitted"
+                            "model": model_key,
+                            "strategy": strategy,
+                            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        }
+                        with open(tracking_path, "w") as f:
+                            json.dump(tracking, f, indent=2)
+                    batch_ids = submit_openai(
+                        queries, model_key, strategy, api_key,
+                        on_chunk_success=_persist_chunk)
                     tracking[batch_name] = {
                         "provider": provider,
                         "batch_ids": batch_ids,
