@@ -420,11 +420,19 @@ def stage_wait(args: argparse.Namespace, run_dirs: list[Path]) -> None:
                 tracking = json.load(f)
             for batch_name, info in tracking.items():
                 status = info.get("status")
-                if status in ("completed", "ended"):
+                # Terminal states: stop polling regardless of success/failure.
+                # Downstream stages (download/parse) handle partial-success
+                # bundles via output_file_ids on whichever chunks completed.
+                if status in ("completed", "ended", "completed_with_failures",
+                              "failed", "expired", "cancelled"):
+                    if status != "completed" and status != "ended":
+                        log(f"  {run_dir.name}/{batch_name}: {status} "
+                            f"({info.get('failed_chunks', 0)} chunk(s) failed)",
+                            level="warn")
                     continue
                 if info.get("provider") == "google" and status == "completed":
                     continue
-                # Anything else is still pending
+                # Anything else (in_progress/finalizing/validating/submitted) is still pending
                 all_done = False
                 log(f"  {run_dir.name}/{batch_name}: {status}", level="info")
         if all_done:

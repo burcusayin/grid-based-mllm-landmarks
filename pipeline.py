@@ -30,6 +30,50 @@ import tempfile
 import time
 from pathlib import Path
 
+
+# ============================================================
+# Atomic-write helpers
+# ============================================================
+# Every persistent write (tracking, downloaded chunks, parsed_responses,
+# compliance_stats, query_index) goes through these. The pattern is:
+# write to a temp file in the same directory, fsync to disk, then atomically
+# rename to the final path. POSIX rename is atomic, so a reader either sees
+# the old file or the new file — never a half-written one. If the process
+# crashes mid-write, the temp file is left behind but the destination is
+# untouched. Resume logic re-runs the write cleanly.
+
+def atomic_write_bytes(path, data):
+    """Atomically write bytes to path."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(prefix="." + path.name + ".",
+                                          dir=str(path.parent))
+    try:
+        with os.fdopen(tmp_fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, str(path))
+        return path
+    except Exception:
+        if os.path.exists(tmp_name):
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        raise
+
+
+def atomic_write_text(path, text):
+    """Atomically write text to path (UTF-8)."""
+    return atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def atomic_write_json(path, obj, **dump_kwargs):
+    """Atomically write a JSON-serialisable object to path."""
+    dump_kwargs.setdefault("indent", 2)
+    return atomic_write_text(path, json.dumps(obj, **dump_kwargs))
+
 import config
 
 
@@ -401,8 +445,7 @@ def cmd_prepare(args):
     # Save query index
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     index_path = config.RESULTS_DIR / "query_index.json"
-    with open(index_path, "w") as f:
-        json.dump(queries, f, indent=2)
+    atomic_write_json(index_path, queries)
     print(f"Query index saved: {index_path}")
 
     # Show summary of what will be submitted
@@ -632,8 +675,7 @@ def submit_google(queries, model_key, strategy, api_key):
                 })
 
             chunk_path = config.RESPONSES_DIR / f"{batch_name}_chunk{chunk_num:03d}.json"
-            with open(chunk_path, "w") as f:
-                json.dump(paired, f, indent=2)
+            atomic_write_json(chunk_path, paired)
             chunk_results.append(str(chunk_path))
             print(f"    Saved: {chunk_path}")
 
@@ -778,8 +820,7 @@ def cmd_submit(args):
                             "strategy": strategy,
                             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                         }
-                        with open(tracking_path, "w") as f:
-                            json.dump(tracking, f, indent=2)
+                        atomic_write_json(tracking_path, tracking)
                     batch_ids = submit_openai(
                         queries, model_key, strategy, api_key,
                         on_chunk_success=_persist_chunk)
@@ -822,9 +863,8 @@ def cmd_submit(args):
                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 }
 
-            # Save tracking after each submission
-            with open(tracking_path, "w") as f:
-                json.dump(tracking, f, indent=2)
+            # Save tracking after each submission (atomic)
+            atomic_write_json(tracking_path, tracking)
 
     print(f"\nTracking saved: {tracking_path}")
 
@@ -915,6 +955,22 @@ def cmd_status(args):
                 completed_count += cc
                 total_count += tc
 
+                # If a batch reached a non-completed terminal state, capture
+                # OpenAI's failure detail so the operator can see what happened.
+                # OpenAI returns errors in batch_resp["errors"]["data"] (a list).
+                error_detail = None
+                if b_status in ("failed", "cancelled", "expired"):
+                    err_obj = batch_resp.get("errors")
+                    if err_obj:
+                        # First error message is enough to identify the cause
+                        # (e.g., "insufficient_quota", "validation_error").
+                        try:
+                            first = err_obj.get("data", [{}])[0]
+                            error_detail = (f"{first.get('code', 'unknown')}: "
+                                            f"{first.get('message', '')[:200]}")
+                        except Exception:
+                            error_detail = str(err_obj)[:200]
+
                 # Record per-chunk progress so subsequent polls do not lose
                 # this information if the next poll hits a transient failure.
                 chunk_progress[batch_id] = {
@@ -922,29 +978,58 @@ def cmd_status(args):
                     "output_file_id": batch_resp.get("output_file_id"),
                     "completed_requests": cc,
                     "total_requests": tc,
+                    "error_detail": error_detail,
                 }
 
-            # Aggregate bundle status: completed only when every active chunk
-            # has been recorded as completed AND has an output_file_id.
+            # Aggregate bundle status. Three possible terminal states:
+            #   completed: every chunk completed with output_file_id
+            #   completed_with_failures: some chunks completed, others terminal-failed
+            #   failed: all chunks reached a non-completed terminal state
+            # Non-terminal states (in_progress/finalizing/validating) keep the
+            # bundle in "submitted" so the orchestrator continues polling.
+            TERMINAL = {"completed", "failed", "cancelled", "expired"}
             active_ids = [bid for bid in info.get("batch_ids", [])
                           if not bid.startswith("ERROR")]
-            all_completed = active_ids and all(
-                chunk_progress.get(bid, {}).get("status") == "completed"
-                and chunk_progress.get(bid, {}).get("output_file_id")
-                for bid in active_ids
-            )
-            if all_completed:
-                info["status"] = "completed"
-                # Preserve original chunk order for downstream download logic.
+            chunk_states = [chunk_progress.get(bid, {}).get("status")
+                             for bid in active_ids]
+            all_terminal = active_ids and all(s in TERMINAL for s in chunk_states)
+            n_completed = sum(1 for s in chunk_states if s == "completed")
+            n_failed = sum(1 for s in chunk_states
+                            if s in ("failed", "cancelled", "expired"))
+
+            if all_terminal:
+                if n_completed == len(active_ids):
+                    info["status"] = "completed"
+                elif n_completed > 0:
+                    info["status"] = "completed_with_failures"
+                    info["failed_chunks"] = n_failed
+                else:
+                    info["status"] = "failed"
+                    info["failed_chunks"] = n_failed
+                # Save the output_file_ids of any chunks that DID complete so
+                # download can still recover their data, even if other chunks
+                # of the same bundle failed.
                 info["output_file_ids"] = [
-                    chunk_progress[bid]["output_file_id"] for bid in active_ids
+                    chunk_progress[bid].get("output_file_id")
+                    for bid in active_ids
+                    if chunk_progress.get(bid, {}).get("status") == "completed"
+                    and chunk_progress.get(bid, {}).get("output_file_id")
                 ]
 
             details = f"{completed_count}/{total_count} requests"
+            if n_failed:
+                details += f" ({n_failed} chunk(s) terminal-failed)"
             if chunk_errors:
-                details += f" ({len(chunk_errors)} chunk error(s) — will retry)"
-            status_label = "completed" if all_completed else "in_progress"
+                details += f" ({len(chunk_errors)} poll error(s) — will retry)"
+            status_label = info.get("status", "in_progress") if all_terminal else "in_progress"
             print(f"{batch_name:<40} {provider:<12} {status_label:<15} {details}")
+
+            # Surface OpenAI failure reasons to stderr so the orchestrator log
+            # captures them (run_pilot.py's run_pipeline forwards stderr).
+            for bid in active_ids:
+                cp = chunk_progress.get(bid, {})
+                if cp.get("status") in ("failed", "cancelled", "expired") and cp.get("error_detail"):
+                    print(f"  ✗ {bid[:24]}: {cp['error_detail']}", file=sys.stderr)
 
         # Check Anthropic batch status
         elif provider == "anthropic":
@@ -975,8 +1060,8 @@ def cmd_status(args):
         elif provider == "google":
             print(f"{batch_name:<40} {provider:<12} {status:<15} sync (already done)")
 
-    with open(tracking_path, "w") as f:
-        json.dump(tracking, f, indent=2)
+    # Persist updated chunk_progress / status (atomic — no torn writes)
+    atomic_write_json(tracking_path, tracking)
 
 
 # ============================================================
@@ -1000,7 +1085,10 @@ def cmd_download(args):
     for batch_name, info in tracking.items():
         provider = info["provider"]
 
-        if provider == "openai" and info.get("status") == "completed":
+        # Download whichever chunks completed, even if the bundle had partial
+        # failures. info.output_file_ids was set by cmd_status to include only
+        # successful chunks' output files, so this loop is safe.
+        if provider == "openai" and info.get("status") in ("completed", "completed_with_failures"):
             for i, file_id in enumerate(info.get("output_file_ids", [])):
                 out_path = config.RESPONSES_DIR / f"{batch_name}_chunk{i:03d}_results.jsonl"
                 if out_path.exists():
@@ -1020,11 +1108,15 @@ def cmd_download(args):
                     data = _openai_call_with_retries(
                         _dl_openai_chunk,
                         _label=f"download {batch_name} chunk {i}")
-                    with open(out_path, "wb") as f:
-                        f.write(data)
+                    # Sanity check: response should be non-empty JSONL
+                    if not data or len(data) < 10:
+                        raise RuntimeError(
+                            f"download returned suspiciously small payload "
+                            f"({len(data)} bytes) — refusing to write")
+                    atomic_write_bytes(out_path, data)
                     print(f"{batch_name} chunk {i}: Downloaded to {out_path}")
                 except Exception as e:
-                    print(f"{batch_name} chunk {i}: ERROR - {e}")
+                    print(f"{batch_name} chunk {i}: ERROR - {e}", file=sys.stderr)
 
         elif provider == "anthropic" and info.get("status") == "ended":
             for batch_id in info.get("batch_ids", []):
@@ -1049,11 +1141,14 @@ def cmd_download(args):
                     data = _openai_call_with_retries(
                         _dl_anthropic,
                         _label=f"download {batch_name}")
-                    with open(out_path, "wb") as f:
-                        f.write(data)
+                    if not data or len(data) < 10:
+                        raise RuntimeError(
+                            f"download returned suspiciously small payload "
+                            f"({len(data)} bytes) — refusing to write")
+                    atomic_write_bytes(out_path, data)
                     print(f"{batch_name}: Downloaded to {out_path}")
                 except Exception as e:
-                    print(f"{batch_name}: ERROR - {e}")
+                    print(f"{batch_name}: ERROR - {e}", file=sys.stderr)
 
         elif provider == "google":
             print(f"{batch_name}: Results already saved during submission")
@@ -1437,15 +1532,15 @@ def cmd_parse(args):
             add_record(model_key, strategy, custom_id, response_text, resp_file.name)
 
     # Save unified results as a list of records (no more dict-keyed overwrites)
+    # Atomic write: a crash mid-write cannot leave a torn parsed_responses.json
+    # that downstream analysis would silently load.
     out_path = config.RESULTS_DIR / "parsed_responses.json"
-    with open(out_path, "w") as f:
-        json.dump(records, f, indent=2)
+    atomic_write_json(out_path, records)
 
     # Compute instruction compliance stats (Issues 5 + 8)
     compliance = compute_compliance_stats(records)
     compliance_path = config.RESULTS_DIR / "compliance_stats.json"
-    with open(compliance_path, "w") as f:
-        json.dump(compliance, f, indent=2)
+    atomic_write_json(compliance_path, compliance)
 
     # Per-(model, strategy) compliance breakdown
     from collections import defaultdict
