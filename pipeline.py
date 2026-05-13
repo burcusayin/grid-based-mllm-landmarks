@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import sys
@@ -166,7 +167,42 @@ def parse_excel():
 # ============================================================
 
 def generate_prompt(query, strategy):
-    """Generate (system_prompt, user_prompt) for a query + strategy."""
+    """Generate (system_prompt, user_prompt) for a query + strategy.
+
+    Strategies:
+      zero_shot              — minimal task instruction
+      guided                 — guided system prompt + FDI numbering announcement
+                               + tooth-number-and-name on FDI-flagged landmarks
+      guided_no_tooth_num    — strict-literal of the colleague's prompt-revision
+                               proposal (REJECTED by data): identical to `guided`
+                               everywhere except on FDI-flagged landmarks, where
+                               the user prompt's "tooth #N (anatomic name)" phrase
+                               is replaced by just "the anatomic name". Used by
+                               the FDI tooth-number ablation in
+                               results_ablation_no_tooth_num/.
+      guided_patient_left    — patient-frame disambiguation variant (REJECTED by
+                               data): identical to `guided` everywhere except on
+                               FDI-flagged landmarks, where the parenthetical
+                               inside the user prompt (e.g. "(lower left canine)")
+                               is rewritten to lead with "patient's left" — the
+                               FDI prefix and tooth number are KEPT, only the
+                               parenthetical anatomic name is changed. For
+                               non-FDI landmarks, byte-identical to `guided`.
+                               Used by the Variant A ablation in
+                               results_ablation_patient_left/.
+      guided_no_LR           — system-prompt diagnostic variant: identical to
+                               `guided` everywhere except that the panoramic
+                               L–R inversion clause is REMOVED from the system
+                               prompt. The user prompt and the rest of the
+                               system prompt are byte-identical to `guided`.
+                               This is a DIAGNOSTIC, not a candidate canonical
+                               prompt (it would also remove the
+                               Mental_Foramen_L improvement). For non-PANORAMIC
+                               landmarks, byte-identical to `guided` (which is
+                               already L–R-clause-free for PA and CEPH). Used
+                               by the Variant C ablation in
+                               results_ablation_no_LR/.
+    """
     sheet = query["sheet"]
     grid = config.GRID_SPECS[sheet]
     lm_type = query["landmark_type"]
@@ -192,8 +228,18 @@ def generate_prompt(query, strategy):
                 fdi_prefix=fdi_prefix, Identify=identify,
             )
 
-    elif strategy == "guided":
-        modality_clause = config.GUIDED_MODALITY_CLAUSES.get(sheet, "")
+    elif strategy in ("guided", "guided_no_tooth_num", "guided_patient_left",
+                       "guided_no_LR"):
+        # guided_no_LR: identical to guided except the panoramic L–R inversion
+        # clause is removed from the system prompt. This is a Variant C
+        # diagnostic — it tests whether the L–R clause itself is the proximate
+        # cause of the Tooth_33_Apex regression. For non-PANORAMIC modalities
+        # the modality clause is already empty, so guided_no_LR produces a
+        # system prompt byte-identical to guided.
+        if strategy == "guided_no_LR":
+            modality_clause = ""
+        else:
+            modality_clause = config.GUIDED_MODALITY_CLAUSES.get(sheet, "")
         grid_explanation = config.GUIDED_SYSTEM_ADDITION.format(
             cols=grid["cols"],
             max_row=grid["max_row_letter"],
@@ -201,15 +247,78 @@ def generate_prompt(query, strategy):
         )
         system_prompt = config.SYSTEM_PROMPT + "\n\n" + grid_explanation
 
+        # Description-only overrides for FDI-flagged landmarks. The system
+        # prompt and the user-prompt skeleton are identical to `guided`; only
+        # the {landmark_description} slot is swapped. For non-FDI landmarks
+        # we fall through to the else clause and produce a prompt that is
+        # byte-identical to `guided`.
+        #
+        # Description lookup precedence: query field (newer query_indexes
+        # carry it directly) → config.LANDMARKS lookup (older query_indexes
+        # don't).
+        override_desc = None
+        if strategy == "guided_no_tooth_num" and uses_fdi:
+            override_desc = query.get("landmark_description_en_no_fdi")
+            if not override_desc:
+                landmark_def = next(
+                    (lm for lm in config.LANDMARKS.get(sheet, [])
+                     if lm["structure"] == query.get("structure")),
+                    None,
+                )
+                override_desc = (landmark_def or {}).get("description_en_no_fdi")
+            if not override_desc:
+                raise ValueError(
+                    f"guided_no_tooth_num requires description_en_no_fdi for "
+                    f"FDI-flagged landmark {query.get('structure')}; "
+                    f"add it to config.LANDMARKS."
+                )
+        elif strategy == "guided_patient_left" and uses_fdi:
+            override_desc = query.get("landmark_description_en_patient_frame")
+            if not override_desc:
+                landmark_def = next(
+                    (lm for lm in config.LANDMARKS.get(sheet, [])
+                     if lm["structure"] == query.get("structure")),
+                    None,
+                )
+                override_desc = (landmark_def or {}).get("description_en_patient_frame")
+            if not override_desc:
+                raise ValueError(
+                    f"guided_patient_left requires description_en_patient_frame "
+                    f"for FDI-flagged landmark {query.get('structure')}; "
+                    f"add it to config.LANDMARKS."
+                )
+
+        if override_desc is not None:
+            # For guided_no_tooth_num we drop the FDI announcement and use
+            # the no-FDI description. For guided_patient_left we KEEP the
+            # FDI announcement (and the tooth number inside the parenthetical
+            # description that is retained in description_en_patient_frame).
+            if strategy == "guided_no_tooth_num":
+                effective_desc = override_desc
+                effective_fdi_prefix = fdi_prefix   # KEEP per strict-literal proposal
+                effective_identify = identify
+            elif strategy == "guided_patient_left":
+                effective_desc = override_desc
+                effective_fdi_prefix = fdi_prefix   # KEEP (patient-frame change is description-only)
+                effective_identify = identify
+            else:
+                effective_desc = override_desc
+                effective_fdi_prefix = fdi_prefix
+                effective_identify = identify
+        else:
+            effective_desc = desc
+            effective_fdi_prefix = fdi_prefix
+            effective_identify = identify
+
         if lm_type == "point":
             user_prompt = config.GUIDED_POINT_TEMPLATE.format(
-                landmark_description=desc,
-                fdi_prefix=fdi_prefix, Identify=identify,
+                landmark_description=effective_desc,
+                fdi_prefix=effective_fdi_prefix, Identify=effective_identify,
             )
         else:
             user_prompt = config.GUIDED_AREA_TEMPLATE.format(
-                landmark_description=desc,
-                fdi_prefix=fdi_prefix, Identify=identify,
+                landmark_description=effective_desc,
+                fdi_prefix=effective_fdi_prefix, Identify=effective_identify,
             )
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
@@ -457,6 +566,467 @@ def cmd_prepare(args):
 
 
 # ============================================================
+# Prepare V2 — Final dataset (consensus GT + students + 2 raters w/ washout)
+# ============================================================
+#
+# The v2 prepare path reads the FINAL benchmark Excel
+# (data/Final_Dental_MLLM_Benchmark_Data.xlsx) which differs from the original
+# in three ways:
+#   1. Two specialists rated every query (OMFR_1 + OMFR_2) instead of just one,
+#      with intra-rater washout re-ratings on a 180-query subset.
+#   2. A team-adjudicated CONSENSUS_Ground_Truth column supersedes OMFR_1 as
+#      the canonical GT for downstream analyses.
+#   3. The 40 per-student columns are replaced by a single Student_Response
+#      column holding the team-adjudicated student consensus per query.
+#
+# parse_excel_v2 uses HEADER-BASED column lookup (not fixed indices) so the
+# parser tolerates further column reorderings without code changes. It is a
+# strict superset of parse_excel: every field the legacy schema produced is
+# still emitted, with new fields (omfr_1_second, omfr_2_second, student)
+# added. The legacy parse_excel is left untouched so results_full/ remains
+# byte-reproducible from its original source.
+#
+# cmd_prepare_v2 writes to config.RESULTS_DIR (typically results_consensus/)
+# and additionally cryptographically anchors to results_full/ by recording
+# the SHA-256 of every raw OpenAI batch JSONL that the consensus-GT
+# re-evaluation will read. Any drift in those frozen outputs is caught at the
+# next preflight rather than silently re-scoring a different model snapshot.
+
+V2_REQUIRED_COLUMNS = [
+    "Image_ID", "Category", "Target_Structure", "Question_Prompt",
+    "OMFR_1", "OMFR_1_Second", "OMFR_2", "OMFR_2_Second",
+    "CONSENSUS_Ground_Truth", "Student_Response",
+]
+
+
+def _normalize_cell_value(value):
+    """Normalize an Excel cell value to a clean string, or None if blank.
+    Whitespace is stripped; values that read as empty after stripping
+    become None so downstream code can rely on truthiness."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s if s else None
+
+
+def parse_excel_v2(excel_path):
+    """Parse the FINAL benchmark Excel using header-based column lookup.
+
+    Required columns (any order): Image_ID, Category, Target_Structure,
+    Question_Prompt, OMFR_1, OMFR_1_Second, OMFR_2, OMFR_2_Second,
+    CONSENSUS_Ground_Truth, Student_Response.
+
+    Returns the same query-dict shape as parse_excel, plus:
+        omfr_1_second  — OMFR_1's washout re-rating (None on un-rerated rows)
+        omfr_2_second  — OMFR_2's washout re-rating (None on un-rerated rows)
+        student        — single team-adjudicated student consensus cell
+    The canonical ground-truth field for v2 callers is consensus_gt; omfr_1
+    is preserved unchanged so v1 sensitivity comparisons remain possible.
+    """
+    import openpyxl
+
+    wb = openpyxl.load_workbook(str(excel_path))
+    queries = []
+
+    for sheet_name in ["PANORAMIC", "PERIAPICAL", "CEPHALOMETRIC"]:
+        ws = wb[sheet_name]
+        grid = config.GRID_SPECS[sheet_name]
+        landmarks = config.LANDMARKS[sheet_name]
+        lm_per_image = grid["landmarks_per_image"]
+
+        # Build header map from the first row, validating required columns.
+        header = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        col_index = {h: i + 1 for i, h in enumerate(header) if h is not None}
+        missing = [c for c in V2_REQUIRED_COLUMNS if c not in col_index]
+        if missing:
+            raise ValueError(
+                f"{excel_path.name} sheet {sheet_name!r} is missing required "
+                f"columns: {missing}. Found columns: {sorted(col_index)}"
+            )
+
+        for row_idx in range(2, ws.max_row + 1):
+            data_row_num = row_idx - 1
+            image_num = -(-data_row_num // lm_per_image)  # ceiling division
+            image_id = f"{grid['image_prefix']}_{image_num:03d}"
+
+            structure = _normalize_cell_value(ws.cell(row_idx, col_index["Target_Structure"]).value)
+            if not structure:
+                continue
+
+            landmark_def = next(
+                (lm for lm in landmarks if lm["structure"] == structure), None
+            )
+            if not landmark_def:
+                print(f"WARNING: Unknown structure '{structure}' in {sheet_name} row {row_idx}")
+                continue
+
+            image_path = grid["image_dir"] / f"{image_id}.png"
+
+            queries.append({
+                "query_id": f"{image_id}_{structure}",
+                "sheet": sheet_name,
+                "image_id": image_id,
+                "image_path": str(image_path),
+                "category": _normalize_cell_value(ws.cell(row_idx, col_index["Category"]).value),
+                "structure": structure,
+                "landmark_type": landmark_def["type"],
+                "landmark_description_en": landmark_def["description_en"],
+                "landmark_description_en_no_fdi": landmark_def.get("description_en_no_fdi"),
+                "landmark_description_en_patient_frame": landmark_def.get("description_en_patient_frame"),
+                "uses_fdi": landmark_def.get("uses_fdi", False),
+                "original_prompt_tr": _normalize_cell_value(
+                    ws.cell(row_idx, col_index["Question_Prompt"]).value),
+                "omfr_1":        _normalize_cell_value(ws.cell(row_idx, col_index["OMFR_1"]).value),
+                "omfr_1_second": _normalize_cell_value(ws.cell(row_idx, col_index["OMFR_1_Second"]).value),
+                "omfr_2":        _normalize_cell_value(ws.cell(row_idx, col_index["OMFR_2"]).value),
+                "omfr_2_second": _normalize_cell_value(ws.cell(row_idx, col_index["OMFR_2_Second"]).value),
+                "consensus_gt":  _normalize_cell_value(ws.cell(row_idx, col_index["CONSENSUS_Ground_Truth"]).value),
+                "student":       _normalize_cell_value(ws.cell(row_idx, col_index["Student_Response"]).value),
+            })
+
+    wb.close()
+    print(f"Parsed {len(queries)} queries from {excel_path.name} "
+          f"({sum(1 for q in queries if q['sheet'] == 'PANORAMIC')} PAN, "
+          f"{sum(1 for q in queries if q['sheet'] == 'PERIAPICAL')} PA, "
+          f"{sum(1 for q in queries if q['sheet'] == 'CEPHALOMETRIC')} CEPH)")
+    return queries
+
+
+def _sha256_file(path):
+    """Return hex SHA-256 of the file at path."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def cmd_prepare_v2(args):
+    """Build the consensus-GT query index and anchor to a frozen GPT-5.4 run.
+
+    Reads the FINAL Excel, validates that every required column is populated
+    according to the methodology document, and emits an extended query_index
+    to config.RESULTS_DIR (sandbox should be results_consensus/, set via the
+    DENTAL_MLLM_RESULTS_DIR env var).
+
+    If --anchor-to is given (path to an existing sandbox such as results_full),
+    the SHA-256 of every raw JSONL response file under that sandbox's
+    run{N}/responses/ is recorded into reanalysis_anchor.json. Subsequent
+    re-evaluation scripts can verify these hashes haven't drifted before
+    re-scoring against consensus_gt — making it impossible to silently
+    re-analyse a different model snapshot.
+
+    No API calls. No writes outside config.RESULTS_DIR.
+    """
+    excel_path = Path(args.excel) if getattr(args, "excel", None) else (
+        config.DATA_DIR / "Final_Dental_MLLM_Benchmark_Data.xlsx"
+    )
+    if not excel_path.exists():
+        print(f"ERROR: Final Excel not found at {excel_path}", file=sys.stderr)
+        sys.exit(1)
+    excel_sha = _sha256_file(excel_path)
+    print(f"Final Excel: {excel_path}")
+    print(f"  SHA-256: {excel_sha}")
+
+    queries = parse_excel_v2(excel_path)
+
+    # Sanity checks specific to the v2 schema
+    n_total = len(queries)
+    expected_total = 900
+    if n_total != expected_total:
+        print(f"ERROR: expected {expected_total} queries, got {n_total}", file=sys.stderr)
+        sys.exit(1)
+
+    # Required-field completeness — these MUST be populated for every row
+    for field in ("omfr_1", "omfr_2", "consensus_gt", "student"):
+        nulls = [q["query_id"] for q in queries if not q.get(field)]
+        if nulls:
+            print(f"ERROR: {len(nulls)} queries have null {field}; first 5: {nulls[:5]}",
+                  file=sys.stderr)
+            sys.exit(1)
+    print(f"Required-field completeness OK (omfr_1, omfr_2, consensus_gt, student all populated).")
+
+    # OMFR_*_Second is partial by design (washout-period subset)
+    n_o1s = sum(1 for q in queries if q.get("omfr_1_second"))
+    n_o2s = sum(1 for q in queries if q.get("omfr_2_second"))
+    print(f"Intra-rater coverage: omfr_1_second populated for {n_o1s}/{n_total} queries; "
+          f"omfr_2_second for {n_o2s}/{n_total}.")
+
+    # Image existence
+    missing = [q for q in queries if not Path(q["image_path"]).exists()]
+    if missing:
+        print(f"ERROR: {len(missing)} images not found:", file=sys.stderr)
+        for q in missing[:5]:
+            print(f"  {q['image_path']}", file=sys.stderr)
+        sys.exit(1)
+    print(f"All {n_total} images verified.")
+
+    # Save extended query index
+    config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    index_path = config.RESULTS_DIR / "query_index.json"
+    atomic_write_json(index_path, queries)
+    print(f"Extended query index saved: {index_path}")
+
+    # Manifest
+    manifest = {
+        "schema_version": "v2_consensus",
+        "source_excel": str(excel_path),
+        "source_excel_sha256": excel_sha,
+        "n_queries": n_total,
+        "n_intra_rater_omfr1": n_o1s,
+        "n_intra_rater_omfr2": n_o2s,
+        "canonical_gt_field": "consensus_gt",
+        "preserved_fields_for_sensitivity": ["omfr_1"],
+        "produced_by": "pipeline.cmd_prepare_v2",
+    }
+    atomic_write_json(config.RESULTS_DIR / "v2_manifest.json", manifest)
+
+    # Cryptographic anchor to a frozen GPT-5.4 run (e.g. results_full/)
+    anchor_to = getattr(args, "anchor_to", None)
+    if anchor_to:
+        anchor_root = Path(anchor_to).resolve()
+        if not anchor_root.exists():
+            print(f"ERROR: --anchor-to path does not exist: {anchor_root}", file=sys.stderr)
+            sys.exit(1)
+        if anchor_root == config.RESULTS_DIR.resolve():
+            print(f"ERROR: cannot anchor to the v2 sandbox itself "
+                  f"({anchor_root}); pick an upstream frozen run.", file=sys.stderr)
+            sys.exit(1)
+        anchor = {"anchor_root": str(anchor_root), "files": {}}
+        n_anchored = 0
+        for rep_dir in sorted(anchor_root.glob("run*/responses")):
+            for jl in sorted(rep_dir.glob("*.jsonl")):
+                rel = jl.relative_to(anchor_root)
+                anchor["files"][str(rel)] = {
+                    "sha256": _sha256_file(jl),
+                    "size": jl.stat().st_size,
+                }
+                n_anchored += 1
+        # Also anchor the upstream query_index, if present, since it defines
+        # the (custom_id → image/landmark) mapping the responses encode.
+        upstream_qi = anchor_root / "query_index.json"
+        if upstream_qi.exists():
+            anchor["upstream_query_index"] = {
+                "path": str(upstream_qi.relative_to(anchor_root)),
+                "sha256": _sha256_file(upstream_qi),
+                "size": upstream_qi.stat().st_size,
+            }
+        atomic_write_json(config.RESULTS_DIR / "reanalysis_anchor.json", anchor)
+        print(f"Anchored {n_anchored} JSONL files from {anchor_root} → "
+              f"{config.RESULTS_DIR/'reanalysis_anchor.json'}")
+    else:
+        print("(no --anchor-to specified; skipping JSONL anchor)")
+
+    print(f"\nv2 sandbox ready at {config.RESULTS_DIR}")
+
+
+# ============================================================
+# Prepare Ablation — focused subset for the FDI×L-R interaction test
+# ============================================================
+#
+# This builds a tightly-filtered query_index for the FDI ablation experiment.
+# It is explicitly designed so the user CANNOT accidentally re-run the entire
+# 900-query benchmark: the prepare step asserts on (a) the requested
+# structures filter is non-empty, (b) the resulting query count matches the
+# expected number for that filter, and (c) the sandbox is not a v1/v2
+# directory. The submit step inherits the standard `.api_lock`, per-chunk
+# persistence, atomic writes, and SHA anchoring.
+#
+# Cryptographic anchoring: the ablation sandbox records SHAs of the Final
+# Excel, the v2 query_index, and (if --anchor-to is given) every raw JSONL
+# at that path. The downstream analysis script verifies all of these before
+# scoring or comparing.
+
+def cmd_prepare_ablation(args):
+    """Build a focused query_index for an ablation experiment.
+
+    Filters parse_excel_v2's output by --structures (comma-separated) and
+    writes the result to config.RESULTS_DIR/query_index.json plus a manifest
+    describing the filter and the ablation provenance.
+
+    Refuses if:
+      - the resulting filter is empty
+      - the resulting count differs from --expected-count (when supplied)
+      - config.RESULTS_DIR resolves to a known v1/v2 sandbox or `data/`
+      - the Final Excel is missing or unreadable
+
+    No API calls. No writes outside config.RESULTS_DIR.
+    """
+    # ── Hard sandbox isolation ─────────────────────────────────────
+    sandbox = config.RESULTS_DIR.resolve()
+    forbidden = []
+    for name in ("results_full", "results_consensus", "data"):
+        p = (config.PROJECT_ROOT / name).resolve()
+        if sandbox == p or p in sandbox.parents:
+            forbidden.append(str(p))
+    if forbidden:
+        print(f"ERROR: sandbox {sandbox} is or lives inside a frozen/canonical "
+              f"directory ({forbidden}). Refusing to prepare ablation here.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    # ── Parse args ─────────────────────────────────────────────────
+    excel_path = Path(args.excel) if getattr(args, "excel", None) else (
+        config.DATA_DIR / "Final_Dental_MLLM_Benchmark_Data.xlsx"
+    )
+    if not excel_path.exists():
+        print(f"ERROR: Final Excel not found at {excel_path}", file=sys.stderr)
+        sys.exit(1)
+
+    structures_arg = (getattr(args, "structures", None) or "").strip()
+    if not structures_arg:
+        print(f"ERROR: --structures is required (comma-separated, e.g. "
+              f"'Tooth_33_Apex'); refusing to prepare an unfiltered ablation.",
+              file=sys.stderr)
+        sys.exit(1)
+    target_structures = [s.strip() for s in structures_arg.split(",") if s.strip()]
+
+    # ── Load + filter ──────────────────────────────────────────────
+    excel_sha = _sha256_file(excel_path)
+    print(f"Final Excel: {excel_path}")
+    print(f"  SHA-256: {excel_sha}")
+
+    all_queries = parse_excel_v2(excel_path)
+    queries = [q for q in all_queries if q["structure"] in target_structures]
+    print(f"Filter applied (structures = {target_structures}): "
+          f"{len(queries)} queries kept (of {len(all_queries)})")
+    if not queries:
+        print(f"ERROR: filter produced 0 queries; check --structures spelling.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    expected_count = getattr(args, "expected_count", None)
+    if expected_count is not None and len(queries) != expected_count:
+        print(f"ERROR: expected {expected_count} queries after filter, "
+              f"got {len(queries)}.", file=sys.stderr)
+        sys.exit(1)
+
+    # ── Field completeness ─────────────────────────────────────────
+    for field in ("consensus_gt", "omfr_1", "omfr_2", "student"):
+        nulls = [q["query_id"] for q in queries if not q.get(field)]
+        if nulls:
+            print(f"ERROR: {len(nulls)} queries have null {field}; "
+                  f"first 5: {nulls[:5]}", file=sys.stderr)
+            sys.exit(1)
+
+    # If any FDI landmark, the alternative-description fields must be populated
+    # for the ablation strategies to work (guided_no_tooth_num needs
+    # description_en_no_fdi; guided_patient_left needs
+    # description_en_patient_frame). We require BOTH because the same prepared
+    # sandbox may be used to render either variant.
+    for q in queries:
+        if q.get("uses_fdi"):
+            for field in ("landmark_description_en_no_fdi",
+                          "landmark_description_en_patient_frame"):
+                if not q.get(field):
+                    print(f"ERROR: FDI landmark {q['structure']} is missing "
+                          f"{field}; add it to config.LANDMARKS.",
+                          file=sys.stderr)
+                    sys.exit(1)
+    print("Required-field completeness OK.")
+
+    # Image existence
+    missing = [q for q in queries if not Path(q["image_path"]).exists()]
+    if missing:
+        print(f"ERROR: {len(missing)} images not found.", file=sys.stderr)
+        sys.exit(1)
+    print(f"All {len(queries)} images verified.")
+
+    # ── Save outputs ───────────────────────────────────────────────
+    config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    index_path = config.RESULTS_DIR / "query_index.json"
+    atomic_write_json(index_path, queries)
+    print(f"Filtered query index saved: {index_path}")
+
+    manifest = {
+        "schema_version": "v2_consensus_ablation",
+        "ablation_label": getattr(args, "label", "fdi_ablation"),
+        "source_excel": str(excel_path),
+        "source_excel_sha256": excel_sha,
+        "filter_structures": target_structures,
+        "n_queries": len(queries),
+        "canonical_gt_field": "consensus_gt",
+        "produced_by": "pipeline.cmd_prepare_ablation",
+    }
+    atomic_write_json(config.RESULTS_DIR / "ablation_manifest.json", manifest)
+
+    # Cryptographic anchor to a frozen run (e.g. results_full/) for the
+    # zero-shot + guided baseline data we will compare against, AND to the
+    # v2 query_index as the canonical source of consensus_gt.
+    anchor_to = getattr(args, "anchor_to", None)
+    v2_index = getattr(args, "v2_index", None) or (
+        config.PROJECT_ROOT / "results_consensus" / "query_index.json"
+    )
+    anchor = {
+        "final_excel_sha256": excel_sha,
+    }
+    if Path(v2_index).exists():
+        anchor["v2_query_index"] = {
+            "path": str(v2_index),
+            "sha256": _sha256_file(Path(v2_index)),
+            "size": Path(v2_index).stat().st_size,
+        }
+    if anchor_to:
+        anchor_root = Path(anchor_to).resolve()
+        if not anchor_root.exists():
+            print(f"ERROR: --anchor-to path does not exist: {anchor_root}",
+                  file=sys.stderr)
+            sys.exit(1)
+        if anchor_root == config.RESULTS_DIR.resolve():
+            print(f"ERROR: cannot anchor to the ablation sandbox itself.",
+                  file=sys.stderr)
+            sys.exit(1)
+        # Filter anchor to JSONLs that contain at least one custom_id matching
+        # our target structures (i.e. the chunks we'll need to re-read).
+        target_query_ids = {q["query_id"] for q in queries}
+        anchor["anchor_root"] = str(anchor_root)
+        anchor["files"] = {}
+        n_total, n_relevant = 0, 0
+        for rep_dir in sorted(anchor_root.glob("run*/responses")):
+            for jl in sorted(rep_dir.glob("*.jsonl")):
+                n_total += 1
+                # peek first line to check if any custom_id matches our filter
+                try:
+                    with open(jl) as f:
+                        first = f.readline()
+                    if not first.strip():
+                        continue
+                    obj = json.loads(first)
+                    cid = obj.get("custom_id", "")
+                    qid = cid.rsplit("_", 1)[0] if "_" in cid else cid
+                    # Cheaper: scan all lines once and short-circuit
+                    relevant = False
+                    with open(jl) as f:
+                        for line in f:
+                            if not line.strip():
+                                continue
+                            try:
+                                cid = json.loads(line)["custom_id"]
+                            except Exception:
+                                continue
+                            qid = (cid[:-len("_zero_shot")] if cid.endswith("_zero_shot")
+                                   else cid[:-len("_guided")] if cid.endswith("_guided")
+                                   else None)
+                            if qid in target_query_ids:
+                                relevant = True
+                                break
+                except Exception as e:
+                    print(f"WARN: could not scan {jl}: {e}", file=sys.stderr)
+                    continue
+                if relevant:
+                    rel = jl.relative_to(anchor_root)
+                    anchor["files"][str(rel)] = {
+                        "sha256": _sha256_file(jl),
+                        "size": jl.stat().st_size,
+                    }
+                    n_relevant += 1
+        print(f"Anchored {n_relevant} relevant JSONL files (of {n_total} scanned) "
+              f"from {anchor_root}")
+    atomic_write_json(config.RESULTS_DIR / "ablation_anchor.json", anchor)
+    print(f"\nAblation sandbox ready at {config.RESULTS_DIR}")
+
+
+# ============================================================
 # Submit Command
 # ============================================================
 
@@ -464,8 +1034,10 @@ def cmd_prepare(args):
 OPENAI_CHUNK_SIZE = 50
 # Google batchGenerateContent: max 100 requests per call
 GOOGLE_CHUNK_SIZE = 100
-# Anthropic: 100K requests per batch, but we chunk for memory
-ANTHROPIC_CHUNK_SIZE = 100
+# Anthropic: 256 MB total batch body limit. With ~3 MB base64-encoded PNG
+# images per panoramic request, 50 requests/chunk ≈ 150 MB body (well under
+# the 256 MB hard cap). 900 panoramic queries → 18 chunks per strategy.
+ANTHROPIC_CHUNK_SIZE = 50
 
 
 _OPENAI_TRANSIENT_HTTP = {401, 408, 429, 500, 502, 503, 504}
@@ -691,40 +1263,68 @@ def submit_google(queries, model_key, strategy, api_key):
 
 
 def submit_anthropic(queries, model_key, strategy, api_key):
-    """Submit queries to Anthropic Message Batches API."""
+    """Submit queries to Anthropic Message Batches API in chunks.
+
+    Anthropic enforces a 256 MB total body size per batch. With base64-encoded
+    PNG images averaging ~3 MB per request (raw image × ~1.34 b64 expansion +
+    JSON overhead), 900 panoramic requests would be ~2.7 GB — 10.6× over the
+    limit. We chunk into ANTHROPIC_CHUNK_SIZE requests per batch, keeping the
+    per-batch body well under 256 MB (~150 MB at chunk_size=50).
+
+    Returns a list of batch_ids (one per chunk), in order. Downstream code
+    in cmd_status / cmd_download iterates over this list.
+    """
     import urllib.request
 
     model_cfg = config.MODELS[model_key]
     img_cache = ImageCache()
+    batch_ids: list[str] = []
+    n = len(queries)
+    total_chunks = -(-n // ANTHROPIC_CHUNK_SIZE)
 
-    # Build all requests (Anthropic handles batching server-side)
-    requests_list = []
-    for i, query in enumerate(queries):
-        img_b64 = img_cache.get(query["image_path"])
-        req = build_anthropic_request(query, strategy, model_cfg, img_b64)
-        requests_list.append(req)
-        if (i + 1) % 100 == 0:
-            print(f"  Prepared {i + 1}/{len(queries)} requests...")
-            img_cache.clear()
+    for chunk_idx in range(0, n, ANTHROPIC_CHUNK_SIZE):
+        chunk = queries[chunk_idx:chunk_idx + ANTHROPIC_CHUNK_SIZE]
+        chunk_num = chunk_idx // ANTHROPIC_CHUNK_SIZE + 1
 
-    body = json.dumps({"requests": requests_list}).encode()
+        requests_list = []
+        for q in chunk:
+            img_b64 = img_cache.get(q["image_path"])
+            requests_list.append(build_anthropic_request(q, strategy, model_cfg, img_b64))
+        # Free image cache between chunks (b64 strings are still in requests_list
+        # but cache stops growing for the next chunk).
+        img_cache.clear()
 
-    print(f"  Submitting {len(requests_list)} requests...")
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages/batches",
-        data=body,
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        batch_resp = json.loads(resp.read())
+        body = json.dumps({"requests": requests_list}).encode()
+        body_mb = len(body) / 1e6
+        print(f"  Chunk {chunk_num}/{total_chunks}: submitting "
+              f"{len(requests_list)} requests ({body_mb:.1f} MB body)...")
+        if body_mb > 240:
+            # Hard refusal before we hit Anthropic's 256 MB limit and waste a call.
+            raise RuntimeError(
+                f"Anthropic chunk body is {body_mb:.1f} MB — exceeds safe 240 MB "
+                f"headroom under the 256 MB hard limit. Lower ANTHROPIC_CHUNK_SIZE."
+            )
 
-    batch_id = batch_resp["id"]
-    print(f"  Batch created: {batch_id}")
-    return [batch_id]
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages/batches",
+            data=body,
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            batch_resp = json.loads(resp.read())
+        batch_id = batch_resp["id"]
+        batch_ids.append(batch_id)
+        print(f"    Batch created: {batch_id}")
+
+        # Small pause between chunks to avoid hammering the API
+        if chunk_num < total_chunks:
+            time.sleep(2)
+
+    return batch_ids
 
 
 def cmd_submit(args):
@@ -760,6 +1360,23 @@ def cmd_submit(args):
             sys.exit(1)
     models_to_run = override_models if override_models is not None else config.ACTIVE_MODELS
 
+    # Determine which strategies to submit. --strategies overrides config.STRATEGIES
+    # for this run only (no file mutation). Used for ablation experiments where
+    # we want to submit only `guided_no_tooth_num` without touching the canonical pair.
+    # Every requested strategy must be one we know how to render in
+    # generate_prompt; we validate by rendering a test prompt for the first query.
+    override_strategies = None
+    if getattr(args, "strategies", None):
+        override_strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
+        for s in override_strategies:
+            try:
+                _ = generate_prompt(queries[0], s)
+            except Exception as e:
+                print(f"ERROR: strategy {s!r} cannot be rendered by generate_prompt: {e}",
+                      file=sys.stderr)
+                sys.exit(1)
+    strategies_to_run = override_strategies if override_strategies is not None else config.STRATEGIES
+
     # Load/create tracking file
     tracking_path = config.RESULTS_DIR / "batch_tracking.json"
     tracking = {}
@@ -768,8 +1385,8 @@ def cmd_submit(args):
             tracking = json.load(f)
 
     print(f"\nSubmitting to models: {models_to_run}")
-    print(f"Strategies:          {config.STRATEGIES}")
-    print(f"Total API calls:     {len(queries) * len(models_to_run) * len(config.STRATEGIES)}")
+    print(f"Strategies:          {strategies_to_run}")
+    print(f"Total API calls:     {len(queries) * len(models_to_run) * len(strategies_to_run)}")
 
     for model_key in models_to_run:
         model_cfg = config.MODELS[model_key]
@@ -781,7 +1398,7 @@ def cmd_submit(args):
             print(f"\nSKIP {model_key}: {e}")
             continue
 
-        for strategy in config.STRATEGIES:
+        for strategy in strategies_to_run:
             batch_name = f"{model_key}_{strategy}"
 
             # Skip if this bundle has already been fully submitted. "partial"
@@ -834,10 +1451,27 @@ def cmd_submit(args):
                     }
                 elif provider == "google":
                     chunk_paths = submit_google(queries, model_key, strategy, api_key)
+                    # Surface any per-chunk errors that submit_google logged
+                    # as "ERROR: ..." entries in the chunk_paths list. Without
+                    # this, status was unconditionally "completed" even when
+                    # individual chunks failed, masking partial-failure
+                    # bundles from downstream code.
+                    chunk_errors = [p for p in chunk_paths
+                                    if isinstance(p, str) and p.startswith("ERROR:")]
+                    n_ok = len(chunk_paths) - len(chunk_errors)
+                    if not chunk_errors:
+                        gstatus = "completed"
+                    elif n_ok > 0:
+                        gstatus = "completed_with_failures"
+                    else:
+                        gstatus = "failed"
                     tracking[batch_name] = {
                         "provider": provider,
                         "chunk_paths": chunk_paths,
-                        "status": "completed",  # Google is synchronous
+                        "chunk_errors": chunk_errors,  # for orchestrator inspection
+                        "n_chunks_ok": n_ok,
+                        "n_chunks_failed": len(chunk_errors),
+                        "status": gstatus,
                         "model": model_key,
                         "strategy": strategy,
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1035,10 +1669,25 @@ def cmd_status(args):
         elif provider == "anthropic":
             try:
                 api_key = config.get_api_key("anthropic")
-                for batch_id in info.get("batch_ids", []):
-                    def _poll_anthropic_batch():
+                # Track per-batch state explicitly so the bundle is only
+                # marked "ended" when EVERY chunk has reached "ended".
+                # Otherwise, with multi-chunk submissions (added 2026-05-13
+                # to handle the 256 MB body limit), an early-finishing chunk
+                # would prematurely flip the bundle status and cause
+                # cmd_download to attempt fetching unfinished batches.
+                batch_progress = info.setdefault("batch_progress", {})
+                batch_ids = info.get("batch_ids", [])
+                ended_count = 0
+                for batch_id in batch_ids:
+                    # Skip re-polling batches we already know are ended.
+                    prev = batch_progress.get(batch_id, {})
+                    if prev.get("processing_status") == "ended":
+                        ended_count += 1
+                        continue
+
+                    def _poll_anthropic_batch(_bid=batch_id):
                         req = urllib.request.Request(
-                            f"https://api.anthropic.com/v1/messages/batches/{batch_id}",
+                            f"https://api.anthropic.com/v1/messages/batches/{_bid}",
                             headers={
                                 "x-api-key": api_key,
                                 "anthropic-version": "2023-06-01",
@@ -1051,9 +1700,24 @@ def cmd_status(args):
                         _poll_anthropic_batch,
                         _label=f"poll {batch_name}/{batch_id[:20]}")
                     b_status = batch_resp.get("processing_status", "unknown")
+                    counts = batch_resp.get("request_counts", {}) or {}
+                    batch_progress[batch_id] = {
+                        "processing_status": b_status,
+                        "succeeded": counts.get("succeeded", 0),
+                        "errored": counts.get("errored", 0),
+                        "canceled": counts.get("canceled", 0),
+                        "expired": counts.get("expired", 0),
+                        "processing": counts.get("processing", 0),
+                    }
                     if b_status == "ended":
-                        info["status"] = "ended"
-                    print(f"{batch_name:<40} {provider:<12} {b_status:<15}")
+                        ended_count += 1
+                    print(f"{batch_name:<40} {provider:<12} {b_status:<15} "
+                          f"({batch_id[:24]}: {counts})")
+
+                # Aggregate bundle status: only "ended" if ALL batches have ended.
+                if batch_ids and ended_count == len(batch_ids):
+                    info["status"] = "ended"
+                    print(f"  → {batch_name}: all {len(batch_ids)} batches ended")
             except Exception as e:
                 print(f"{batch_name:<40} {provider:<12} {'error':<15} {e}")
 
@@ -1119,16 +1783,21 @@ def cmd_download(args):
                     print(f"{batch_name} chunk {i}: ERROR - {e}", file=sys.stderr)
 
         elif provider == "anthropic" and info.get("status") == "ended":
-            for batch_id in info.get("batch_ids", []):
-                out_path = config.RESPONSES_DIR / f"{batch_name}_results.jsonl"
+            # Each batch_id gets a UNIQUE output filename so multi-chunk
+            # submissions don't overwrite each other. The naming convention
+            # mirrors OpenAI's chunked outputs so parse_response_filename
+            # recognises them automatically.
+            for i, batch_id in enumerate(info.get("batch_ids", [])):
+                out_path = (config.RESPONSES_DIR /
+                            f"{batch_name}_chunk{i:03d}_results.jsonl")
                 if out_path.exists():
-                    print(f"{batch_name}: Already downloaded")
+                    print(f"{batch_name} chunk {i}: Already downloaded")
                     continue
 
-                def _dl_anthropic():
+                def _dl_anthropic(_bid=batch_id):
                     api_key = config.get_api_key("anthropic")
                     req = urllib.request.Request(
-                        f"https://api.anthropic.com/v1/messages/batches/{batch_id}/results",
+                        f"https://api.anthropic.com/v1/messages/batches/{_bid}/results",
                         headers={
                             "x-api-key": api_key,
                             "anthropic-version": "2023-06-01",
@@ -1140,15 +1809,15 @@ def cmd_download(args):
                 try:
                     data = _openai_call_with_retries(
                         _dl_anthropic,
-                        _label=f"download {batch_name}")
+                        _label=f"download {batch_name} chunk {i}")
                     if not data or len(data) < 10:
                         raise RuntimeError(
                             f"download returned suspiciously small payload "
                             f"({len(data)} bytes) — refusing to write")
                     atomic_write_bytes(out_path, data)
-                    print(f"{batch_name}: Downloaded to {out_path}")
+                    print(f"{batch_name} chunk {i}: Downloaded to {out_path}")
                 except Exception as e:
-                    print(f"{batch_name}: ERROR - {e}", file=sys.stderr)
+                    print(f"{batch_name} chunk {i}: ERROR - {e}", file=sys.stderr)
 
         elif provider == "google":
             print(f"{batch_name}: Results already saved during submission")
@@ -1333,14 +2002,20 @@ def parse_response_filename(name):
     Expected patterns (all start with `{model_key}_{strategy}`):
       OpenAI    : {model_key}_{strategy}_chunk{N:03d}_results.jsonl
       Google    : {model_key}_{strategy}_chunk{N:03d}.json
-      Anthropic : {model_key}_{strategy}_results.jsonl
+      Anthropic : {model_key}_{strategy}_chunk{N:03d}_results.jsonl
 
     Returns (model_key, strategy) or (None, None) if no pattern matches.
+
+    Uses config.ALL_STRATEGIES (the FULL strategy registry — canonical +
+    ablation variants), not config.STRATEGIES (which is just the active
+    submit-by-default pair). Without this, ablation filenames like
+    `gpt-5.4_guided_no_tooth_num_chunk000_results.jsonl` would mis-attribute
+    to the shorter "guided" prefix and the parsed `strategy` field on each
+    record would silently collapse to "guided". Longest-first iteration
+    ensures `guided_no_tooth_num` is tried before `guided`.
     """
-    # Longest model_key and strategy first so e.g. "claude-sonnet-4.6" is
-    # preferred over any shorter prefix.
     for mk in sorted(config.MODELS.keys(), key=len, reverse=True):
-        for strat in sorted(config.STRATEGIES, key=len, reverse=True):
+        for strat in sorted(config.ALL_STRATEGIES, key=len, reverse=True):
             prefix = f"{mk}_{strat}"
             if name == prefix or name.startswith(prefix + "_") or name.startswith(prefix + "."):
                 return mk, strat
@@ -1608,9 +2283,38 @@ Commands:
     p_prepare.add_argument("--models", type=str, default=None,
                            help="Comma-separated model_keys to include in the summary (informational)")
 
+    p_prepare_v2 = subparsers.add_parser(
+        "prepare_v2",
+        help="Build extended query_index from Final Excel (consensus GT + 2 raters + students)")
+    p_prepare_v2.add_argument("--excel", type=str, default=None,
+                              help="Path to Final benchmark Excel "
+                                   "(default: data/Final_Dental_MLLM_Benchmark_Data.xlsx)")
+    p_prepare_v2.add_argument("--anchor-to", type=str, default=None,
+                              help="Frozen GPT-5.4 run sandbox to cryptographically anchor "
+                                   "raw JSONLs from (e.g. results_full)")
+
+    p_prepare_abl = subparsers.add_parser(
+        "prepare_ablation",
+        help="Build a focused, filtered query_index for an ablation experiment")
+    p_prepare_abl.add_argument("--excel", type=str, default=None,
+                               help="Path to Final benchmark Excel")
+    p_prepare_abl.add_argument("--structures", type=str, required=True,
+                               help="Comma-separated structures to keep (e.g. Tooth_33_Apex)")
+    p_prepare_abl.add_argument("--expected-count", type=int, default=None,
+                               help="Refuse if filter doesn't yield this exact number")
+    p_prepare_abl.add_argument("--anchor-to", type=str, default=None,
+                               help="Frozen GPT-5.4 run to anchor relevant raw JSONLs from")
+    p_prepare_abl.add_argument("--v2-index", type=str, default=None,
+                               help="Path to v2 query_index.json (default: results_consensus/)")
+    p_prepare_abl.add_argument("--label", type=str, default="fdi_ablation",
+                               help="Label for the ablation experiment manifest")
+
     p_submit = subparsers.add_parser("submit", help="Submit batches to APIs")
     p_submit.add_argument("--models", type=str, default=None,
                           help="Comma-separated model_keys to submit (overrides config.ACTIVE_MODELS)")
+    p_submit.add_argument("--strategies", type=str, default=None,
+                          help="Comma-separated strategies to submit (overrides config.STRATEGIES). "
+                               "Used by ablation experiments (e.g. --strategies guided_no_tooth_num).")
 
     subparsers.add_parser("status", help="Check batch processing status")
     subparsers.add_parser("download", help="Download completed batch results")
@@ -1620,6 +2324,8 @@ Commands:
 
     commands = {
         "prepare": cmd_prepare,
+        "prepare_v2": cmd_prepare_v2,
+        "prepare_ablation": cmd_prepare_ablation,
         "submit": cmd_submit,
         "status": cmd_status,
         "download": cmd_download,

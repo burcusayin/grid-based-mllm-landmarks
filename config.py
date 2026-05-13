@@ -107,6 +107,8 @@ LANDMARKS = {
             "structure": "Tooth_33_Apex",
             "type": "point",
             "description_en": "the root apex of tooth #33 (lower left canine)",
+            "description_en_no_fdi": "the root apex of the lower left canine",
+            "description_en_patient_frame": "the root apex of tooth #33 (patient's left lower canine)",
             "description_tr": "33 numaralı dişin kök ucu noktası",
             "uses_fdi": True,
         },
@@ -134,6 +136,8 @@ LANDMARKS = {
             "structure": "Tooth_36_Distal_Apex",
             "type": "point",
             "description_en": "the most apical (tip) point of the distal root of tooth #36 (lower left first molar)",
+            "description_en_no_fdi": "the most apical (tip) point of the distal root of the lower left first molar",
+            "description_en_patient_frame": "the most apical (tip) point of the distal root of tooth #36 (patient's left lower first molar)",
             "description_tr": "36 numaralı dişin distal kök ucunun bittiği en uç nokta",
             "uses_fdi": True,
         },
@@ -141,6 +145,8 @@ LANDMARKS = {
             "structure": "Tooth_36_Mesial_CEJ",
             "type": "point",
             "description_en": "the cemento-enamel junction (CEJ) on the mesial side of tooth #36 (lower left first molar)",
+            "description_en_no_fdi": "the cemento-enamel junction (CEJ) on the mesial side of the lower left first molar",
+            "description_en_patient_frame": "the cemento-enamel junction (CEJ) on the mesial side of tooth #36 (patient's left lower first molar)",
             "description_tr": "36 numaralı dişin mezial servikal bölgesinde, mine ile kök yüzeyinin birleştiği nokta",
             "uses_fdi": True,
         },
@@ -148,6 +154,8 @@ LANDMARKS = {
             "structure": "Tooth_36_Distal_CEJ",
             "type": "point",
             "description_en": "the cemento-enamel junction (CEJ) on the distal side of tooth #36 (lower left first molar)",
+            "description_en_no_fdi": "the cemento-enamel junction (CEJ) on the distal side of the lower left first molar",
+            "description_en_patient_frame": "the cemento-enamel junction (CEJ) on the distal side of tooth #36 (patient's left lower first molar)",
             "description_tr": "36 numaralı dişin distal servikal bölgesinde, mine ile kök yüzeyinin birleştiği nokta",
             "uses_fdi": True,
         },
@@ -285,7 +293,31 @@ ACTIVE_MODELS = ["gpt-5.4", "gemini-3.1-pro"]
 # ============================================================
 # Prompting Strategies
 # ============================================================
+# STRATEGIES is the "active" list — strategies that get submitted by default
+# when pipeline.py submit is run without --strategies override. It is the
+# canonical pair (zero_shot, guided) that drives every main run.
 STRATEGIES = ["zero_shot", "guided"]
+
+# ALL_STRATEGIES is the full registry of every strategy name that
+# pipeline.generate_prompt knows how to render. It MUST include every key
+# that generate_prompt has a branch for — i.e. STRATEGIES plus every ablation
+# variant. Parser code in pipeline.parse_response_filename uses this list
+# (NOT STRATEGIES) so that ablation response files like
+# `gpt-5.4_guided_no_tooth_num_chunk000_results.jsonl` correctly attribute
+# their `strategy` field to "guided_no_tooth_num" rather than collapsing to
+# "guided" (which would silently mis-label every ablation record).
+#
+# When you add a new ablation strategy:
+#   1. Add a branch in pipeline.generate_prompt(query, strategy)
+#   2. Append the strategy name HERE so the response parser recognises it
+ALL_STRATEGIES = [
+    "zero_shot",
+    "guided",
+    # Section-10 ablations
+    "guided_no_tooth_num",
+    "guided_patient_left",
+    "guided_no_LR",
+]
 
 # ============================================================
 # API Configuration
