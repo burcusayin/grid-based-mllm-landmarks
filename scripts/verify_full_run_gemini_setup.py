@@ -311,8 +311,9 @@ def main() -> int:
     # count (Gemini will tokenise the same text slightly differently, but the
     # input size is the dominant cost driver and tokenisation gives ±10%).
     # For Gemini specifically, the image token count is fixed by the API
-    # configuration (mediaResolution = MEDIA_RESOLUTION_ULTRA_HIGH → 2240
-    # tokens per image), so the dominant factor is the per-call image cost.
+    # configuration (mediaResolution = MEDIA_RESOLUTION_HIGH → ~2200
+    # tokens per image; this is the max enum value accepted by v1beta), so
+    # the dominant factor is the per-call image cost.
     prompt_tok_per_call_est = None
     if queries:
         # Use observed v2 PAN/guided averages as a reasonable proxy
@@ -335,7 +336,7 @@ def main() -> int:
     in_price = mc.get("batch_input_price_per_1m", 1.00)
     out_price = mc.get("batch_output_price_per_1m", 6.00)
     n_calls_planned = len(queries) * len(expected_strategies) * args.n_reps  # 5400
-    # Gemini ULTRA_HIGH image: 2240 tokens; text: ~200 tokens; total ~2440 prompt-tok per call.
+    # Gemini HIGH image: ~2200 tokens; text: ~200 tokens; total ~2400 prompt-tok per call.
     # Use whichever is larger of (observed-from-v2-GPT) or (Gemini-image-tokens estimate).
     gemini_input_tok_est = (prompt_tok_per_call_est or 2200) + 240  # text-only diff
     avg_out_tok = 10  # 5-20 typical

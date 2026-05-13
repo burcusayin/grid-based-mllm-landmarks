@@ -271,7 +271,7 @@ MODELS = {
         "max_output_tokens": 256,
         "temperature": 0,
         "seed": RANDOM_SEED,                 # Gemini generationConfig.seed
-        "media_resolution": "MEDIA_RESOLUTION_ULTRA_HIGH",  # 2240 tokens/image
+        "media_resolution": "MEDIA_RESOLUTION_HIGH",  # ~2200 tokens/image (max in v1beta)
     },
     "claude-sonnet-4.6": {
         "provider": "anthropic",

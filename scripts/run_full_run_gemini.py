@@ -49,8 +49,8 @@ USAGE:
 
 Cost
 ----
-Naive upper-bound projection (5,400 calls × ULTRA_HIGH image res × Gemini
-batch pricing $1.00 / $6.00 per 1M): ~$15.
+Naive upper-bound projection (5,400 calls × HIGH image res ~2200 tok/image
+× Gemini batch pricing $1.00 / $6.00 per 1M): ~$15.
 """
 from __future__ import annotations
 
@@ -163,6 +163,8 @@ def stage_prepare_sandbox(args, sandbox: Path) -> None:
     """
     log("Stage 1: prepare sandbox (copy v2 query_index, write manifests)",
         level="step")
+    sys.path.insert(0, str(ROOT))
+    import config  # type: ignore
     sandbox.mkdir(parents=True, exist_ok=True)
 
     v2_qi = ROOT / "results_consensus" / "query_index.json"
@@ -262,7 +264,8 @@ def stage_prepare_sandbox(args, sandbox: Path) -> None:
             "temperature": 0,
             "seed": 42,
             "max_output_tokens": 256,
-            "media_resolution": "MEDIA_RESOLUTION_ULTRA_HIGH",
+            "media_resolution": config.MODELS[MODEL_KEY].get(
+                "media_resolution", "MEDIA_RESOLUTION_HIGH"),
         },
         "source_excel_sha256": excel_sha,
         "source_excel_matches_v2_manifest": (
