@@ -480,15 +480,15 @@ def stage_submit(args, sandbox: Path) -> list[Path]:
     run_dirs: list[Path] = []
     master_index = sandbox / "query_index.json"
 
-    # Terminal states for orchestrator-level idempotency. "submitted" means
-    # cmd_submit ran but cmd_status has not yet seen everything reach a
-    # terminal Google state; we still skip re-submitting in that case.
-    DONE_OR_SUBMITTED = (
-        "submitted", "succeeded", "completed_with_failures", "failed",
-        # Legacy values from the pre-fix sync attempt — leave for re-entry
-        # against an old sandbox without confusing the operator.
-        "completed",
-    )
+    # Terminal states that mean the bundle does NOT need re-submission.
+    # We mirror the Anthropic orchestrator's done_states pattern:
+    #  - "succeeded" / "completed_with_failures" → outer skips, work is done
+    #  - "submitted" → NOT included; outer re-calls cmd_submit which inner-
+    #    skips because the bundle is mid-flight (status != failed/partial)
+    #  - "failed" → NOT included; we WANT to retry failed bundles
+    #  - "completed" (legacy from the pre-fix sync attempt) → NOT included;
+    #    those bundles never actually produced data and should be retried
+    DONE_STATES = ("succeeded", "completed_with_failures")
 
     for i in range(1, args.repetitions + 1):
         run_dir = sandbox / f"run{i}"
@@ -518,10 +518,10 @@ def stage_submit(args, sandbox: Path) -> list[Path]:
             expected = {f"{MODEL_KEY}_{s}" for s in STRATEGIES}
             already = {
                 k for k, v in tracking.items()
-                if v.get("status") in DONE_OR_SUBMITTED
+                if v.get("status") in DONE_STATES
             }
             if expected.issubset(already):
-                log(f"  run{i}: already submitted — skipping", level="ok")
+                log(f"  run{i}: already submitted+terminal — skipping", level="ok")
                 run_dirs.append(run_dir)
                 continue
 
