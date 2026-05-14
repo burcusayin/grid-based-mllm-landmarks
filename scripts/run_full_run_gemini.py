@@ -427,7 +427,10 @@ def stage_live_test(args, sandbox: Path) -> None:
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        # 5 min timeout: Gemini 3.1 Pro thinking can run 30-60s for a single
+        # query (especially area landmarks). 60s was too tight once
+        # max_output_tokens was bumped to 2048 to fit thinking + answer.
+        with urllib.request.urlopen(req, timeout=300) as resp:
             payload = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         msg = e.read().decode(errors="replace")[:400]
