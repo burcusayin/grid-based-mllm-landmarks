@@ -24,18 +24,23 @@ Pipeline (mirrors the ablation orchestrator pattern, scaled to a full run):
                             Language API to verify auth, request format,
                             and response parsing before committing to the
                             5,400-call batch
-  Stage 4  submit           three reps × two strategies × 18 chunks each
-                            via pipeline.cmd_submit with --models
-                            gemini-3.1-pro. Each rep writes into
-                            sandbox/run{N}/responses/ via the
+  Stage 4  submit           three reps × two strategies × ~2 file-batches
+                            each (one per GOOGLE_FILE_CHUNK_SIZE chunk).
+                            ASYNC — submit returns once every batch is
+                            CREATED with state BATCH_STATE_PENDING. Each rep
+                            writes into sandbox/run{N}/ via the
                             DENTAL_MLLM_RESULTS_DIR env var.
-  Stage 5  wait             Gemini is synchronous — submit returns when each
-                            chunk is finished. So this stage is a no-op for
-                            Gemini, kept for parity with the Anthropic
-                            orchestrator and for verbose status output.
-  Stage 6  parse            run pipeline.cmd_parse per rep, producing
+  Stage 5  wait             poll pipeline.cmd_status until every batch
+                            reaches BATCH_STATE_SUCCEEDED / FAILED /
+                            CANCELLED / EXPIRED. Google's batch SLA is
+                            "within 24h" with no fast-path; expect 30 min -
+                            several hours per rep.
+  Stage 6  download         run pipeline.cmd_download per rep — fetches the
+                            JSONL result file behind each succeeded batch
+                            and converts it to chunk-JSON for the parser.
+  Stage 7  parse            run pipeline.cmd_parse per rep, producing
                             sandbox/run{N}/parsed_responses.json
-  Stage 7  summary          aggregate compliance / call counts across reps
+  Stage 8  summary          aggregate compliance / call counts across reps
 
   finally  relock          recreate .api_lock so accidental future runs cannot
                             spend API money without an explicit unlock
@@ -44,6 +49,7 @@ USAGE:
     .venv/bin/python scripts/run_full_run_gemini.py
         [--sandbox results_full_gemini]
         [--repetitions 3]
+        [--poll-seconds 120]  (how often to poll Google batch state)
         [--no-live-test]      (skip the live single-call test; NOT recommended)
         [--dry-run]           (synthesise fake responses for pipeline rehearsal)
 
@@ -463,11 +469,26 @@ def stage_submit(args, sandbox: Path) -> list[Path]:
     """Submit each repetition into its own subdirectory so the three reps
     cannot stomp on each other. Each rep's submission goes through
     pipeline.cmd_submit with --models gemini-3.1-pro, redirected via the
-    DENTAL_MLLM_RESULTS_DIR env var."""
-    log("Stage 4: submit (Gemini is synchronous — submit waits for chunk results)",
+    DENTAL_MLLM_RESULTS_DIR env var.
+
+    Gemini submits are ASYNC (file-based batch). cmd_submit returns once
+    every batch is CREATED with state BATCH_STATE_PENDING; stage_wait then
+    polls until each batch reaches a terminal state.
+    """
+    log("Stage 4: submit (Gemini async file-based batch — uploads JSONL, creates batches)",
         level="step")
     run_dirs: list[Path] = []
     master_index = sandbox / "query_index.json"
+
+    # Terminal states for orchestrator-level idempotency. "submitted" means
+    # cmd_submit ran but cmd_status has not yet seen everything reach a
+    # terminal Google state; we still skip re-submitting in that case.
+    DONE_OR_SUBMITTED = (
+        "submitted", "succeeded", "completed_with_failures", "failed",
+        # Legacy values from the pre-fix sync attempt — leave for re-entry
+        # against an old sandbox without confusing the operator.
+        "completed",
+    )
 
     for i in range(1, args.repetitions + 1):
         run_dir = sandbox / f"run{i}"
@@ -495,11 +516,11 @@ def stage_submit(args, sandbox: Path) -> list[Path]:
         if tracking_path.exists():
             tracking = json.loads(tracking_path.read_text())
             expected = {f"{MODEL_KEY}_{s}" for s in STRATEGIES}
-            completed = {
+            already = {
                 k for k, v in tracking.items()
-                if v.get("status") in ("completed", "completed_with_failures")
+                if v.get("status") in DONE_OR_SUBMITTED
             }
-            if expected.issubset(completed):
+            if expected.issubset(already):
                 log(f"  run{i}: already submitted — skipping", level="ok")
                 run_dirs.append(run_dir)
                 continue
@@ -519,21 +540,32 @@ def stage_submit(args, sandbox: Path) -> list[Path]:
 
 
 def _synthesise_fake(run_dir: Path) -> None:
-    """Dry-run: emit fabricated Gemini-format batch outputs so downstream
-    stages (parse, summary) can run without ever calling the API."""
+    """Dry-run: emit fabricated Gemini chunk-JSON files matching the format
+    cmd_download writes for real runs, so downstream stages (parse, summary)
+    can run without ever calling the API.
+
+    Real flow: cmd_submit returns batch IDs (async). cmd_status polls them to
+    BATCH_STATE_SUCCEEDED. cmd_download fetches the result JSONL and converts
+    it to chunk-JSON files. The fake responses below mirror what
+    cmd_download produces, with status='succeeded' in tracking.
+    """
     rng = random.Random(42)
     responses_dir = run_dir / "responses"
     responses_dir.mkdir(parents=True, exist_ok=True)
     queries = json.loads((run_dir / "query_index.json").read_text())
 
+    # Mirror pipeline.GOOGLE_FILE_CHUNK_SIZE (450) so the per-batch counts
+    # match what the real flow would produce.
+    CHUNK = 450
+
     tracking: dict = {}
     for strat in STRATEGIES:
-        # Gemini chunk size = 100 in pipeline.py; mirror that here
-        for chunk_idx, start in enumerate(range(0, len(queries), 100)):
-            chunk = queries[start:start + 100]
+        batch_ids = []
+        batch_progress = {}
+        for chunk_idx, start in enumerate(range(0, len(queries), CHUNK)):
+            chunk = queries[start:start + CHUNK]
             paired = []
             for q in chunk:
-                # synthesise a plausible cell (random letter A-H, num 1-16)
                 cell = chr(ord("A") + rng.randint(0, 7)) + str(rng.randint(1, 16))
                 paired.append({
                     "custom_id": f"{q['query_id']}_{strat}",
@@ -547,72 +579,96 @@ def _synthesise_fake(run_dir: Path) -> None:
                         },
                     },
                 })
-            chunk_path = responses_dir / f"{MODEL_KEY}_{strat}_chunk{chunk_idx + 1:03d}.json"
+            chunk_path = responses_dir / f"{MODEL_KEY}_{strat}_chunk{chunk_idx:03d}.json"
             chunk_path.write_text(json.dumps(paired))
-        # Minimal tracking entry — mirror the schema cmd_submit now writes
-        # (n_chunks_ok, n_chunks_failed, chunk_errors) so stage_wait passes
-        # cleanly under --dry-run.
+            fake_bid = f"batches/dry-run-{strat}-{chunk_idx:03d}"
+            batch_ids.append(fake_bid)
+            batch_progress[fake_bid] = {
+                "state": "BATCH_STATE_SUCCEEDED",
+                "batchStats": {"requestCount": str(len(chunk)),
+                                "completedRequestCount": str(len(chunk))},
+                "output_file": f"files/dry-run-{strat}-{chunk_idx:03d}",
+            }
         tracking[f"{MODEL_KEY}_{strat}"] = {
             "provider": "google",
-            "chunk_paths": [],
-            "chunk_errors": [],
-            "n_chunks_ok": (len(queries) + 99) // 100,  # ~9 per strategy
-            "n_chunks_failed": 0,
-            "status": "completed",
+            "batch_ids": batch_ids,
+            "batch_progress": batch_progress,
+            "status": "succeeded",
             "model": MODEL_KEY,
             "strategy": strat,
         }
     (run_dir / "batch_tracking.json").write_text(json.dumps(tracking, indent=2))
 
 
-# ── Stage 5: wait ──────────────────────────────────────────────────
+# ── Stage 5: wait (poll Google batch states until terminal) ───────
 
 def stage_wait(args, run_dirs: list[Path]) -> None:
-    # Gemini submit is synchronous — submit() returns when chunks are done.
-    # We keep the stage for parity AND to inspect chunk_paths for any
-    # "ERROR: ..." entries that submit_google may have logged. cmd_submit
-    # (pipeline.py) now sets status to "completed_with_failures" or "failed"
-    # when any chunk errored; we honour that here and refuse to proceed.
+    """Poll cmd_status repeatedly until every batch in every bundle reaches a
+    Google-terminal state (BATCH_STATE_SUCCEEDED / FAILED / CANCELLED / EXPIRED).
+
+    Gemini batches are async with no SLA on speed; this loop typically runs
+    for 30 min - several hours per rep.
+    """
     if args.dry_run:
         return
-    log("Stage 5: wait (Gemini synchronous — verifying every chunk succeeded)",
+    log("Stage 5: wait — poll Google batch state until terminal",
         level="step")
+    poll_seconds = getattr(args, "poll_seconds", 120)
+    DONE_BUNDLE_STATES = ("succeeded", "completed_with_failures", "failed")
     for rd in run_dirs:
-        tracking = json.loads((rd / "batch_tracking.json").read_text())
-        problems = []
-        for name, info in tracking.items():
-            st = info.get("status")
-            if st == "completed":
-                continue
-            if st in ("completed_with_failures", "failed"):
-                errs = info.get("chunk_errors", [])
-                problems.append(
-                    f"{name}: status={st}, "
-                    f"{info.get('n_chunks_failed', '?')} failed chunk(s), "
-                    f"first error: {errs[0][:200] if errs else 'unknown'}")
-            else:
-                problems.append(f"{name}: unexpected status={st!r}")
-        if problems:
-            raise FullRunError(
-                f"{rd.name}: refusing to proceed — submit had failures:\n"
-                + "\n".join(f"    {p}" for p in problems))
-        log(f"  {rd.name}: all bundles completed (every chunk succeeded)",
-            level="ok")
+        log(f"  polling {rd.name}", level="step")
+        while True:
+            run_pipeline([str(VENV_PY), "pipeline.py", "status"],
+                         sandbox=rd, capture=True)
+            tracking = json.loads((rd / "batch_tracking.json").read_text())
+            all_done = True
+            for name, info in tracking.items():
+                if info.get("status") not in DONE_BUNDLE_STATES:
+                    all_done = False
+                    break
+            if all_done:
+                log(f"    {rd.name} all bundles terminal", level="ok")
+                # Refuse to proceed if every bundle failed — saves the
+                # operator from wasting time on a fully-broken run.
+                problems = [
+                    f"{name}: {info.get('status')}"
+                    for name, info in tracking.items()
+                    if info.get("status") == "failed"
+                ]
+                if problems:
+                    raise FullRunError(
+                        f"{rd.name}: every batch in some bundle terminal-failed:\n"
+                        + "\n".join(f"    {p}" for p in problems))
+                break
+            log(f"    not yet terminal; sleeping {poll_seconds}s", level="info")
+            time.sleep(poll_seconds)
 
 
-# ── Stage 6: parse ─────────────────────────────────────────────────
+# ── Stage 6: download (fetch result files + convert to chunk JSON) ─
+
+def stage_download(args, run_dirs: list[Path]) -> None:
+    """Download the result file behind every SUCCEEDED Google batch and
+    convert it to the chunk-JSON format the parser already understands."""
+    if args.dry_run:
+        return
+    log("Stage 6: download Google batch result files", level="step")
+    for rd in run_dirs:
+        run_pipeline([str(VENV_PY), "pipeline.py", "download"], sandbox=rd)
+
+
+# ── Stage 7: parse ─────────────────────────────────────────────────
 
 def stage_parse(args, run_dirs: list[Path]) -> None:
-    log("Stage 6: parse responses → per-run parsed_responses.json",
+    log("Stage 7: parse responses → per-run parsed_responses.json",
         level="step")
     for rd in run_dirs:
         run_pipeline([str(VENV_PY), "pipeline.py", "parse"], sandbox=rd)
 
 
-# ── Stage 7: summary ───────────────────────────────────────────────
+# ── Stage 8: summary ───────────────────────────────────────────────
 
 def stage_summary(args, sandbox: Path, run_dirs: list[Path]) -> None:
-    log("Stage 7: summary", level="step")
+    log("Stage 8: summary", level="step")
     total_calls = 0
     total_failures = 0
     for rd in run_dirs:
@@ -658,6 +714,8 @@ def main() -> None:
     )
     ap.add_argument("--sandbox", default=SANDBOX_DEFAULT)
     ap.add_argument("--repetitions", type=int, default=3)
+    ap.add_argument("--poll-seconds", type=int, default=120,
+                    help="Google batch poll interval (default: 120s)")
     ap.add_argument("--no-live-test", action="store_true",
                     help="Skip the live single-call test (NOT recommended)")
     ap.add_argument("--dry-run", action="store_true",
@@ -722,6 +780,7 @@ def main() -> None:
         stage_live_test(args, sandbox)
         run_dirs = stage_submit(args, sandbox)
         stage_wait(args, run_dirs)
+        stage_download(args, run_dirs)
         stage_parse(args, run_dirs)
         stage_summary(args, sandbox, run_dirs)
         log("Gemini 3.1 Pro full run complete", level="ok")

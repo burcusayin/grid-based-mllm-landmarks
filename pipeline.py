@@ -1032,8 +1032,11 @@ def cmd_prepare_ablation(args):
 
 # OpenAI batch file size limit ~200MB; each request is ~3MB → ~60 per chunk
 OPENAI_CHUNK_SIZE = 50
-# Google batchGenerateContent: max 100 requests per call
-GOOGLE_CHUNK_SIZE = 100
+# Gemini file-based Batch API: JSONL upload, max 2 GB per file. With ~3 MB
+# base64-encoded PNG per panoramic request, ~450 requests/file ≈ 1.35 GB.
+# 900 queries → 2 batches per strategy (per rep). Chunk size is the number
+# of requests packed into ONE uploaded JSONL file (= one batch operation).
+GOOGLE_FILE_CHUNK_SIZE = 450
 # Anthropic: 256 MB total batch body limit. With ~3 MB base64-encoded PNG
 # images per panoramic request, 50 requests/chunk ≈ 150 MB body (well under
 # the 256 MB hard cap). 900 panoramic queries → 18 chunks per strategy.
@@ -1191,75 +1194,169 @@ def submit_openai(queries, model_key, strategy, api_key, *,
 
 
 def submit_google(queries, model_key, strategy, api_key):
-    """Submit queries to Google Gemini batchGenerateContent API."""
-    import urllib.request
+    """Submit queries to Google's FILE-BASED Gemini Batch API.
+
+    File-based async batch flow (one batch per uploaded JSONL):
+
+      1. Build JSONL bytes for a chunk of GOOGLE_FILE_CHUNK_SIZE queries.
+         Each line is {"key": "<custom_id>", "request": <GenerateContentRequest>}.
+         The inner request.model field must be the full resource path
+         "models/<model_id>".
+      2. Upload the JSONL via Files API using the resumable-upload protocol:
+         (a) POST metadata to /upload/v1beta/files with X-Goog-Upload-Command: start
+             → response header X-Goog-Upload-URL points at the upload session.
+         (b) PUT the bytes to that URL with X-Goog-Upload-Command: "upload, finalize"
+             → response body has the created file resource (file.name = "files/<id>").
+      3. Create a batch referencing the uploaded file at
+         POST /v1beta/models/<model_id>:batchGenerateContent
+         with body {"batch": {"display_name": ..., "input_config": {"file_name": "files/<id>"}}}
+         → response has the batch resource name "batches/<id>" and metadata.state.
+
+    Returns a list of batch resource names ("batches/<id>"), one per uploaded
+    chunk. cmd_status iterates over this list; cmd_download fetches the result
+    file linked from each batch's response.dest.
+
+    The endpoint is ASYNC — submit returns immediately with state
+    BATCH_STATE_PENDING. cmd_status must poll for terminal state. Google's
+    batch SLA is "within 24h" with no fast-path even for small batches.
+
+    Replaces the old sync :batchGenerateContent attempt (which never worked —
+    that endpoint is async and the payload schema was wrong).
+    """
+    import urllib.request, urllib.error
 
     model_cfg = config.MODELS[model_key]
+    model_resource = f"models/{model_cfg['model_id']}"
     img_cache = ImageCache()
-    chunk_results = []
-
-    config.RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
+    batch_ids: list[str] = []
+    n = len(queries)
+    total_chunks = -(-n // GOOGLE_FILE_CHUNK_SIZE)
     batch_name = f"{model_key}_{strategy}"
 
-    for chunk_idx in range(0, len(queries), GOOGLE_CHUNK_SIZE):
-        chunk = queries[chunk_idx:chunk_idx + GOOGLE_CHUNK_SIZE]
-        chunk_num = chunk_idx // GOOGLE_CHUNK_SIZE + 1
-        total_chunks = -(-len(queries) // GOOGLE_CHUNK_SIZE)
+    for chunk_idx in range(0, n, GOOGLE_FILE_CHUNK_SIZE):
+        chunk = queries[chunk_idx:chunk_idx + GOOGLE_FILE_CHUNK_SIZE]
+        chunk_num = chunk_idx // GOOGLE_FILE_CHUNK_SIZE + 1
 
-        print(f"  Chunk {chunk_num}/{total_chunks} ({len(chunk)} requests)...")
+        # ----- 1. Build JSONL bytes -----
+        lines = []
+        for q in chunk:
+            img_b64 = img_cache.get(q["image_path"])
+            req_data = build_google_request(q, strategy, model_cfg, img_b64)
+            inner = dict(req_data["request"])
+            # File-based batch requires the model as full resource path
+            inner["model"] = model_resource
+            lines.append(json.dumps({
+                "key": req_data["custom_id"],
+                "request": inner,
+            }))
+        img_cache.clear()
+        jsonl_bytes = ("\n".join(lines) + "\n").encode()
+        n_bytes = len(jsonl_bytes)
+        n_mb = n_bytes / 1e6
+        print(f"  Chunk {chunk_num}/{total_chunks}: {len(chunk)} requests, "
+              f"{n_mb:.1f} MB JSONL...")
+        if n_mb > 1900:
+            # Hard refusal under Google's 2 GB file size limit.
+            raise RuntimeError(
+                f"Gemini JSONL chunk is {n_mb:.1f} MB — exceeds safe 1900 MB "
+                f"headroom under Google's 2 GB file limit. "
+                f"Lower GOOGLE_FILE_CHUNK_SIZE."
+            )
 
-        # Build requests for this chunk
-        custom_ids = []
-        batch_requests = []
-        for query in chunk:
-            img_b64 = img_cache.get(query["image_path"])
-            req_data = build_google_request(query, strategy, model_cfg, img_b64)
-            custom_ids.append(req_data["custom_id"])
-            batch_requests.append(req_data["request"])
-
-        body = json.dumps({"requests": batch_requests}).encode()
-        model_id = model_cfg["model_id"]
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/"
-            f"models/{model_id}:batchGenerateContent?key={api_key}"
+        # ----- 2a. Initiate resumable upload -----
+        display_name = f"{batch_name}_chunk{chunk_num:03d}"
+        init_url = (
+            f"https://generativelanguage.googleapis.com/upload/v1beta/files"
+            f"?key={api_key}"
         )
+        init_body = json.dumps({"file": {"display_name": display_name}}).encode()
+        init_req = urllib.request.Request(
+            init_url, data=init_body,
+            headers={
+                "X-Goog-Upload-Protocol": "resumable",
+                "X-Goog-Upload-Command": "start",
+                "X-Goog-Upload-Header-Content-Length": str(n_bytes),
+                "X-Goog-Upload-Header-Content-Type": "application/jsonl",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(init_req, timeout=60) as resp:
+                upload_url = resp.headers.get("X-Goog-Upload-URL")
+        except urllib.error.HTTPError as e:
+            err = e.read().decode(errors="replace")[:400]
+            raise RuntimeError(
+                f"Gemini Files API init failed ({e.code}): {err}"
+            ) from e
+        if not upload_url:
+            raise RuntimeError(
+                "Gemini Files API: no X-Goog-Upload-URL header returned by init"
+            )
 
-        req = urllib.request.Request(
-            url, data=body,
+        # ----- 2b. Upload bytes + finalize -----
+        upload_req = urllib.request.Request(
+            upload_url, data=jsonl_bytes, method="POST",
+            headers={
+                "Content-Length": str(n_bytes),
+                "X-Goog-Upload-Offset": "0",
+                "X-Goog-Upload-Command": "upload, finalize",
+            },
+        )
+        try:
+            with urllib.request.urlopen(upload_req, timeout=600) as resp:
+                file_info = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            err = e.read().decode(errors="replace")[:400]
+            raise RuntimeError(
+                f"Gemini Files API upload failed ({e.code}): {err}"
+            ) from e
+        file_name = (
+            (file_info.get("file") or {}).get("name")
+            or file_info.get("name")
+        )
+        if not file_name:
+            raise RuntimeError(
+                f"Gemini Files API: no file.name in response: {str(file_info)[:300]}"
+            )
+        print(f"    Uploaded: {file_name}")
+
+        # ----- 3. Create batch referencing the file -----
+        batch_url = (
+            f"https://generativelanguage.googleapis.com/v1beta/"
+            f"{model_resource}:batchGenerateContent?key={api_key}"
+        )
+        batch_payload = {
+            "batch": {
+                "display_name": display_name,
+                "input_config": {"file_name": file_name},
+            }
+        }
+        batch_req = urllib.request.Request(
+            batch_url, data=json.dumps(batch_payload).encode(),
             headers={"Content-Type": "application/json"},
         )
-
         try:
-            with urllib.request.urlopen(req, timeout=600) as resp:
-                result = json.loads(resp.read())
+            with urllib.request.urlopen(batch_req, timeout=60) as resp:
+                batch_info = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            err = e.read().decode(errors="replace")[:500]
+            raise RuntimeError(
+                f"Gemini batch creation failed ({e.code}): {err}"
+            ) from e
+        batch_id = batch_info.get("name")
+        if not batch_id:
+            raise RuntimeError(
+                f"Gemini batch creation: no 'name' in response: {str(batch_info)[:300]}"
+            )
+        state = batch_info.get("metadata", {}).get("state", "?")
+        print(f"    Batch created: {batch_id} (state={state})")
+        batch_ids.append(batch_id)
 
-            # Pair responses with custom IDs
-            responses = result.get("responses", [])
-            if len(responses) != len(custom_ids):
-                print(f"    WARNING: Google returned {len(responses)} responses "
-                      f"for {len(custom_ids)} requests in chunk {chunk_num}. "
-                      f"Missing requests will be recorded as None.")
-            paired = []
-            for i, cid in enumerate(custom_ids):
-                paired.append({
-                    "custom_id": cid,
-                    "response": responses[i] if i < len(responses) else None,
-                })
-
-            chunk_path = config.RESPONSES_DIR / f"{batch_name}_chunk{chunk_num:03d}.json"
-            atomic_write_json(chunk_path, paired)
-            chunk_results.append(str(chunk_path))
-            print(f"    Saved: {chunk_path}")
-
-        except Exception as e:
-            print(f"    ERROR: {e}")
-            chunk_results.append(f"ERROR: {e}")
-
-        # Rate limiting between chunks
+        # Brief pause between chunks (rate-limit hygiene)
         if chunk_num < total_chunks:
             time.sleep(2)
 
-    return chunk_results
+    return batch_ids
 
 
 def submit_anthropic(queries, model_key, strategy, api_key):
@@ -1450,28 +1547,16 @@ def cmd_submit(args):
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                     }
                 elif provider == "google":
-                    chunk_paths = submit_google(queries, model_key, strategy, api_key)
-                    # Surface any per-chunk errors that submit_google logged
-                    # as "ERROR: ..." entries in the chunk_paths list. Without
-                    # this, status was unconditionally "completed" even when
-                    # individual chunks failed, masking partial-failure
-                    # bundles from downstream code.
-                    chunk_errors = [p for p in chunk_paths
-                                    if isinstance(p, str) and p.startswith("ERROR:")]
-                    n_ok = len(chunk_paths) - len(chunk_errors)
-                    if not chunk_errors:
-                        gstatus = "completed"
-                    elif n_ok > 0:
-                        gstatus = "completed_with_failures"
-                    else:
-                        gstatus = "failed"
+                    # File-based async batch: submit_google returns a list of
+                    # batch resource names ("batches/<id>"), one per uploaded
+                    # JSONL chunk. Status is "submitted" until cmd_status polls
+                    # every batch to a terminal state (BATCH_STATE_SUCCEEDED /
+                    # FAILED / CANCELLED / EXPIRED).
+                    batch_ids = submit_google(queries, model_key, strategy, api_key)
                     tracking[batch_name] = {
                         "provider": provider,
-                        "chunk_paths": chunk_paths,
-                        "chunk_errors": chunk_errors,  # for orchestrator inspection
-                        "n_chunks_ok": n_ok,
-                        "n_chunks_failed": len(chunk_errors),
-                        "status": gstatus,
+                        "batch_ids": batch_ids,
+                        "status": "submitted",  # non-terminal until cmd_status
                         "model": model_key,
                         "strategy": strategy,
                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1722,7 +1807,86 @@ def cmd_status(args):
                 print(f"{batch_name:<40} {provider:<12} {'error':<15} {e}")
 
         elif provider == "google":
-            print(f"{batch_name:<40} {provider:<12} {status:<15} sync (already done)")
+            # Poll every batch in the bundle. Mirror Anthropic's per-batch
+            # tracking: bundle only marked "succeeded" when ALL batches reach
+            # BATCH_STATE_SUCCEEDED; "completed_with_failures" if some succeeded
+            # and others terminal-failed; "failed" if none succeeded.
+            try:
+                api_key = config.get_api_key("google")
+                batch_progress = info.setdefault("batch_progress", {})
+                batch_ids = info.get("batch_ids", [])
+                if not batch_ids:
+                    print(f"{batch_name:<40} {provider:<12} {status:<15} (no batch_ids)")
+                    continue
+
+                TERMINAL_GOOGLE = {
+                    "BATCH_STATE_SUCCEEDED", "BATCH_STATE_FAILED",
+                    "BATCH_STATE_CANCELLED", "BATCH_STATE_EXPIRED",
+                    # Docs are inconsistent — handle JOB_STATE_* prefix too
+                    "JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED",
+                    "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED",
+                }
+                SUCCESS_GOOGLE = {"BATCH_STATE_SUCCEEDED", "JOB_STATE_SUCCEEDED"}
+
+                for batch_id in batch_ids:
+                    # Skip re-polling batches we already know are terminal.
+                    prev = batch_progress.get(batch_id, {})
+                    if prev.get("state") in TERMINAL_GOOGLE:
+                        continue
+
+                    def _poll_google(_bid=batch_id):
+                        url = (
+                            f"https://generativelanguage.googleapis.com/v1beta/"
+                            f"{_bid}?key={api_key}"
+                        )
+                        req = urllib.request.Request(url)
+                        with urllib.request.urlopen(req) as resp:
+                            return json.loads(resp.read())
+
+                    try:
+                        batch_resp = _openai_call_with_retries(
+                            _poll_google,
+                            _label=f"poll {batch_name}/{batch_id[:30]}")
+                    except Exception as e:
+                        msg = f"chunk {batch_id[:30]}: {type(e).__name__}: {e}"
+                        print(f"{batch_name:<40} {provider:<12} {'poll-error':<15} {msg}",
+                              file=sys.stderr)
+                        continue
+
+                    md = batch_resp.get("metadata", {})
+                    b_state = md.get("state", "unknown")
+                    stats = md.get("batchStats", {})
+                    # When SUCCEEDED, the result file is at response.dest.fileName
+                    # (camelCase in REST responses) or response.dest.file_name
+                    response_obj = batch_resp.get("response", {}) or {}
+                    dest = response_obj.get("dest", {}) or {}
+                    output_file = dest.get("fileName") or dest.get("file_name")
+                    batch_progress[batch_id] = {
+                        "state": b_state,
+                        "batchStats": stats,
+                        "output_file": output_file,
+                    }
+                    print(f"{batch_name:<40} {provider:<12} {b_state:<25} "
+                          f"({batch_id.split('/')[-1][:24]}: {stats})")
+
+                # Aggregate bundle status across all batch states
+                states = [batch_progress.get(bid, {}).get("state") for bid in batch_ids]
+                n_succ = sum(1 for s in states if s in SUCCESS_GOOGLE)
+                n_terminal = sum(1 for s in states if s in TERMINAL_GOOGLE)
+                if n_terminal == len(batch_ids):
+                    if n_succ == len(batch_ids):
+                        info["status"] = "succeeded"
+                    elif n_succ > 0:
+                        info["status"] = "completed_with_failures"
+                        info["failed_chunks"] = len(batch_ids) - n_succ
+                    else:
+                        info["status"] = "failed"
+                        info["failed_chunks"] = len(batch_ids) - n_succ
+                    print(f"  → {batch_name}: terminal "
+                          f"({n_succ}/{len(batch_ids)} succeeded, "
+                          f"status={info['status']})")
+            except Exception as e:
+                print(f"{batch_name:<40} {provider:<12} {'error':<15} {e}")
 
     # Persist updated chunk_progress / status (atomic — no torn writes)
     atomic_write_json(tracking_path, tracking)
@@ -1819,8 +1983,103 @@ def cmd_download(args):
                 except Exception as e:
                     print(f"{batch_name} chunk {i}: ERROR - {e}", file=sys.stderr)
 
-        elif provider == "google":
-            print(f"{batch_name}: Results already saved during submission")
+        elif provider == "google" and info.get("status") in ("succeeded", "completed_with_failures"):
+            # File-based batch results: for each SUCCEEDED batch, fetch the
+            # JSONL output file linked from response.dest.fileName and convert
+            # it to the chunk-JSON format the parser already understands
+            # (a list of {"custom_id", "response"} objects). Failed batches
+            # are skipped, like OpenAI/Anthropic does on partial failures.
+            api_key = config.get_api_key("google")
+            for i, batch_id in enumerate(info.get("batch_ids", [])):
+                bp = info.get("batch_progress", {}).get(batch_id, {})
+                state = bp.get("state")
+                if state not in ("BATCH_STATE_SUCCEEDED", "JOB_STATE_SUCCEEDED"):
+                    print(f"{batch_name} chunk {i}: skipping ({state})")
+                    continue
+
+                # Naming aligns with the existing parser glob (*_chunk*.json).
+                out_path = config.RESPONSES_DIR / f"{batch_name}_chunk{i:03d}.json"
+                if out_path.exists():
+                    print(f"{batch_name} chunk {i}: Already downloaded")
+                    continue
+
+                output_file = bp.get("output_file")
+                if not output_file:
+                    # Re-query batch to fetch output file name. If state is
+                    # succeeded but no output_file is recorded, the previous
+                    # poll may have missed it (e.g., dest field appeared in a
+                    # later poll cycle).
+                    def _requery(_bid=batch_id):
+                        url = (
+                            f"https://generativelanguage.googleapis.com/v1beta/"
+                            f"{_bid}?key={api_key}"
+                        )
+                        req = urllib.request.Request(url)
+                        with urllib.request.urlopen(req) as resp:
+                            return json.loads(resp.read())
+
+                    try:
+                        br = _openai_call_with_retries(
+                            _requery, _label=f"re-query {batch_id[:30]}")
+                    except Exception as e:
+                        print(f"{batch_name} chunk {i}: re-query ERROR - {e}",
+                              file=sys.stderr)
+                        continue
+                    dest = (br.get("response", {}) or {}).get("dest", {}) or {}
+                    output_file = dest.get("fileName") or dest.get("file_name")
+                    if not output_file:
+                        print(f"{batch_name} chunk {i}: no output_file even after re-query",
+                              file=sys.stderr)
+                        continue
+
+                # Download the result file via the Files API media endpoint.
+                def _dl_google(_f=output_file):
+                    url = (
+                        f"https://generativelanguage.googleapis.com/download/v1beta/"
+                        f"{_f}:download?alt=media&key={api_key}"
+                    )
+                    req = urllib.request.Request(url)
+                    with urllib.request.urlopen(req) as resp:
+                        return resp.read()
+
+                try:
+                    data = _openai_call_with_retries(
+                        _dl_google,
+                        _label=f"download {batch_name} chunk {i}")
+                    if not data or len(data) < 10:
+                        raise RuntimeError(
+                            f"download returned suspiciously small payload "
+                            f"({len(data)} bytes) — refusing to write"
+                        )
+                    # Convert JSONL → chunk JSON: each line is
+                    # {"key": "<custom_id>", "response": <GenerateContentResponse>}
+                    # We re-key to {"custom_id", "response"} for parser parity
+                    # with the existing chunk-JSON format.
+                    paired = []
+                    for line in data.decode().splitlines():
+                        if not line.strip():
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        custom_id = obj.get("key", "")
+                        # File-based result lines have one of:
+                        #   {"key": "...", "response": <GenerateContentResponse>}
+                        #   {"key": "...", "error": {...}}  (per-request failure)
+                        response_obj = obj.get("response")
+                        if response_obj is None and "error" in obj:
+                            # Surface per-request errors so the parser records
+                            # a non-compliant entry with empty parsed_coordinates.
+                            response_obj = {"_error": obj["error"]}
+                        paired.append({
+                            "custom_id": custom_id,
+                            "response": response_obj,
+                        })
+                    atomic_write_json(out_path, paired)
+                    print(f"{batch_name} chunk {i}: downloaded {len(paired)} responses → {out_path}")
+                except Exception as e:
+                    print(f"{batch_name} chunk {i}: ERROR - {e}", file=sys.stderr)
 
         else:
             print(f"{batch_name}: Not ready (status: {info.get('status')})")
