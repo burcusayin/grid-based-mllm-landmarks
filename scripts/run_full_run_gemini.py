@@ -413,7 +413,9 @@ def stage_live_test(args, sandbox: Path) -> None:
         }],
         "generationConfig": {
             "temperature": 0,
-            "maxOutputTokens": 256,
+            # Match the actual batch settings so the live test exercises the
+            # same configuration the batch will use (not a stale 256 default).
+            "maxOutputTokens": model_cfg["max_output_tokens"],
             "seed": 42,
             "mediaResolution": model_cfg.get("media_resolution",
                                               "MEDIA_RESOLUTION_HIGH"),
@@ -662,9 +664,22 @@ def stage_download(args, run_dirs: list[Path]) -> None:
 # ── Stage 7: parse ─────────────────────────────────────────────────
 
 def stage_parse(args, run_dirs: list[Path]) -> None:
+    """Parse downloaded chunk files → parsed_responses.json per rep.
+
+    Idempotency guard: if parsed_responses.json already exists for a rep,
+    skip re-parsing. This protects post-processing artifacts (e.g., merged
+    re-queries) from being clobbered when the orchestrator is re-run with
+    --repetitions > 1 to add more reps. To force re-parse, delete the
+    rep's parsed_responses.json before re-running.
+    """
     log("Stage 7: parse responses → per-run parsed_responses.json",
         level="step")
     for rd in run_dirs:
+        pr = rd / "parsed_responses.json"
+        if pr.exists():
+            log(f"  {rd.name}: parsed_responses.json already exists — "
+                f"skipping re-parse (delete to force re-parse)", level="ok")
+            continue
         run_pipeline([str(VENV_PY), "pipeline.py", "parse"], sandbox=rd)
 
 
