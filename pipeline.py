@@ -1856,11 +1856,20 @@ def cmd_status(args):
                     md = batch_resp.get("metadata", {})
                     b_state = md.get("state", "unknown")
                     stats = md.get("batchStats", {})
-                    # When SUCCEEDED, the result file is at response.dest.fileName
-                    # (camelCase in REST responses) or response.dest.file_name
+                    # When SUCCEEDED, the result file is at response.responsesFile
+                    # (verified against live API 2026-05-14; docs sometimes show
+                    # response.dest.fileName but actual REST returns
+                    # response.responsesFile). metadata.output.responsesFile is
+                    # also populated with the same value.
                     response_obj = batch_resp.get("response", {}) or {}
-                    dest = response_obj.get("dest", {}) or {}
-                    output_file = dest.get("fileName") or dest.get("file_name")
+                    output_file = response_obj.get("responsesFile")
+                    if not output_file:
+                        # Fallback: try metadata.output.responsesFile
+                        output_file = (md.get("output", {}) or {}).get("responsesFile")
+                    if not output_file:
+                        # Last-resort fallback for the docs-style dest field
+                        dest = response_obj.get("dest", {}) or {}
+                        output_file = dest.get("fileName") or dest.get("file_name")
                     batch_progress[batch_id] = {
                         "state": b_state,
                         "batchStats": stats,
@@ -2025,8 +2034,17 @@ def cmd_download(args):
                         print(f"{batch_name} chunk {i}: re-query ERROR - {e}",
                               file=sys.stderr)
                         continue
-                    dest = (br.get("response", {}) or {}).get("dest", {}) or {}
-                    output_file = dest.get("fileName") or dest.get("file_name")
+                    # Result file location: response.responsesFile is the
+                    # canonical field on v1beta REST. Fallback to metadata
+                    # and the docs-style dest.fileName field.
+                    response_obj = br.get("response", {}) or {}
+                    output_file = response_obj.get("responsesFile")
+                    if not output_file:
+                        md_re = br.get("metadata", {})
+                        output_file = (md_re.get("output", {}) or {}).get("responsesFile")
+                    if not output_file:
+                        dest = response_obj.get("dest", {}) or {}
+                        output_file = dest.get("fileName") or dest.get("file_name")
                     if not output_file:
                         print(f"{batch_name} chunk {i}: no output_file even after re-query",
                               file=sys.stderr)

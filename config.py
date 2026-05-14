@@ -268,7 +268,13 @@ MODELS = {
         "batch_api": True,
         "batch_input_price_per_1m": 1.00,   # 50% off standard $2.00
         "batch_output_price_per_1m": 6.00,   # 50% off standard $12.00 (≤200K context)
-        "max_output_tokens": 256,
+        # Gemini 3.1 Pro uses thinking mode internally. The 2026-05-14
+        # mini-canary observed 244 thinking tokens + answer tokens fighting for
+        # the same budget. At 256 max, area-landmark answers got truncated
+        # (finishReason=MAX_TOKENS) and most batch requests were cancelled.
+        # Raised to 2048 to leave generous headroom for thinking + answer;
+        # Gemini bills actual usage, so no cost penalty for unused budget.
+        "max_output_tokens": 2048,
         "temperature": 0,
         "seed": RANDOM_SEED,                 # Gemini generationConfig.seed
         "media_resolution": "MEDIA_RESOLUTION_HIGH",  # ~2200 tokens/image (max in v1beta)
