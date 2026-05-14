@@ -272,9 +272,12 @@ MODELS = {
         # mini-canary observed 244 thinking tokens + answer tokens fighting for
         # the same budget. At 256 max, area-landmark answers got truncated
         # (finishReason=MAX_TOKENS) and most batch requests were cancelled.
-        # Raised to 2048 to leave generous headroom for thinking + answer;
-        # Gemini bills actual usage, so no cost penalty for unused budget.
-        "max_output_tokens": 2048,
+        # Rep 1 of the full run used 2048; in 99/1800 responses (5.5%) the
+        # model still hit MAX_TOKENS during thinking. Raised to 4096 for reps
+        # 2 and 3 to recover the truncated tail. Gemini bills actual usage,
+        # so the higher cap adds only a small marginal cost (~$1 per rep) but
+        # eliminates the truncation failure mode entirely.
+        "max_output_tokens": 4096,
         "temperature": 0,
         "seed": RANDOM_SEED,                 # Gemini generationConfig.seed
         "media_resolution": "MEDIA_RESOLUTION_HIGH",  # ~2200 tokens/image (max in v1beta)

@@ -269,7 +269,7 @@ def stage_prepare_sandbox(args, sandbox: Path) -> None:
         "inference_settings": {
             "temperature": 0,
             "seed": 42,
-            "max_output_tokens": 256,
+            "max_output_tokens": config.MODELS[MODEL_KEY]["max_output_tokens"],
             "media_resolution": config.MODELS[MODEL_KEY].get(
                 "media_resolution", "MEDIA_RESOLUTION_HIGH"),
         },
