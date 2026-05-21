@@ -34,7 +34,7 @@ from docx.shared import Pt, Inches, RGBColor
 from docx.enum.table import WD_ALIGN_VERTICAL
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-ROOT = Path("/Users/burcusayin/Codes/Claude/grid-based-mllm-landmarks").resolve()
+ROOT = Path(__file__).resolve().parent.parent.resolve()
 
 # ============================================================
 # Step 0: Load and verify integrity (asserts catch bugs early)

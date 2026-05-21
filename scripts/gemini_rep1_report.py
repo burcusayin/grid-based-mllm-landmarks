@@ -19,7 +19,7 @@ from docx import Document
 from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-ROOT = Path("/Users/burcusayin/Codes/Claude/grid-based-mllm-landmarks").resolve()
+ROOT = Path(__file__).resolve().parent.parent.resolve()
 
 # ============================================================
 # 0. Load + verify integrity
