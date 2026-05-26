@@ -1,9 +1,9 @@
-# Companion code for: *Comparative Analysis of Multimodal Large Language Models and Dental Students in Radiographic Anatomic Landmark Identification: A Novel Grid-Based Assessment Model*
+# Companion code for the paper titled "*Comparative Analysis of Multimodal Large Language Models and Dental Students in Radiographic Anatomic Landmark Identification: A Novel Grid-Based Assessment Model*"
 
-This repository contains the complete code, statistical-analysis scripts, prompt templates and reproducibility infrastructure used in the manuscript above (submitted to *Dentomaxillofacial Radiology*). It is intended both as supplementary material for reviewers and as a reusable benchmark framework for future MLLM spatial-reasoning studies in dental radiography.
+This repository contains the complete code, statistical-analysis scripts, prompt templates and reproducibility infrastructure used in the manuscript (currently under review). It is intended both as supplementary material for reviewers and as a reusable benchmark framework for future MLLM spatial-reasoning studies in dental radiography.
 
 > **Citation (placeholder — will be replaced on acceptance):**
-> Sayın B. et al. *Comparative Analysis of Multimodal Large Language Models and Dental Students in Radiographic Anatomic Landmark Identification: A Novel Grid-Based Assessment Model.* Dentomaxillofacial Radiology (under review), 2026.
+> Aydemir M.E. et al. *Comparative Analysis of Multimodal Large Language Models and Dental Students in Radiographic Anatomic Landmark Identification: A Novel Grid-Based Assessment Model.* (under review), 2026.
 
 ## What this code does
 
@@ -78,14 +78,14 @@ Key methodological contributions implemented here:
 
 ## Privacy: what is **not** in this repository
 
-The benchmark dataset itself (radiograph PNGs, expert annotations, student responses) is institutional clinical data and is **not** redistributed via this repository. Specifically, the following directories are blocked by `.gitignore` and never pushed:
+The benchmark dataset itself (radiograph PNGs, expert annotations, student responses) is institutional clinical data and is **not** redistributed via this repository. Specifically, the following directories are `.gitignore`d:
 
 * `data/` — the source Excel (`Final_Dental_MLLM_Benchmark_Data.xlsx`) and all 200 anonymised PNG images.
 * `docs/` — the manuscript drafts, cover letter, title page, and colleague correspondence.
 * `results_full/`, `results_full_gemini/`, `results_consensus/`, `results_ablation_*/` — the raw API responses (≥ 1.4 GB of JSONL chunks per repetition) and all derived analysis JSONs.
 * `.env`, `.api_lock`, any `*.key` / `*.pem` — secrets and the safety lock.
 
-**Reviewers and replication seekers**: please contact the corresponding author for data access. Image dataset use is governed by the institutional ethics committee (Decision No: GO 2026/3048; Burdur Mehmet Akif Ersoy University). The code in this repository will operate on any compatible Excel + image set if the schema documented in `config.py` is followed.
+**Reviewers and replication seekers**:  Image dataset use is governed by the institutional ethics committee (Decision No: GO 2026/3048; Burdur Mehmet Akif Ersoy University). The code in this repository will operate on any compatible Excel + image set if the schema documented in `config.py` is followed.
 
 ## Reproducing the results (with your own data)
 
@@ -231,4 +231,4 @@ MIT — see [LICENSE](LICENSE). Code is reusable for academic and commercial pur
 
 ## Contact
 
-Burcu Sayın — burcu.sayin@jc-electronics.me — corresponding author.
+Burcu Sayın — burcusayin.w@gmail.com for inquiries about the code.
