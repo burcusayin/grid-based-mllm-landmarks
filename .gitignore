@@ -24,10 +24,21 @@ data/
 docs/
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Generated artefacts (regenerable from the source via `pipeline.py prepare`)
+# Generated artefacts (regenerable from the source via `pipeline.py prepare`
+# and the analysis scripts). All result directories contain raw API outputs,
+# rater annotations, and student responses — these stay on institutional
+# storage under the ethics-committee data-governance policy.
 results/
-results_pilot/
-results_pilot_*/
+results_*/
+
+# Bare result JSON files that are regenerable from raw data via the
+# canonical-stats / S2-CI scripts but contain no personal data; kept out
+# of the repo because they are derivable.
+results_v4_canonical.json
+results_v4_S2_cis.json
+
+# Backup script files
+*.bak
 
 # Test sandbox
 tests/.smoke_sandbox/

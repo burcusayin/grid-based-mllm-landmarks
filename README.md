@@ -37,7 +37,7 @@ Key methodological contributions implemented here:
 ├── scripts/
 │   ├── reproducibility_manifest.py            ← regenerate full SHA + version manifest
 │   ├── snapshot_prompts.py                    ← persist exact prompts before any run
-│   ├── compare_v1_v2.py                       ← v1↔v2 prompt-revision sensitivity check
+│   ├── export_sanitized_prompts.py            ← regenerate prompts_all900.json (no GT fields)
 │   │
 │   ├── run_pilot.py                           ← legacy cost-capped GPT-only pilot
 │   ├── run_full_run_gemini.py                 ← Gemini 3.1 Pro full-run orchestrator (file-based async batch)
@@ -66,20 +66,11 @@ Key methodological contributions implemented here:
 │   ├── analyze_patient_left_ablation.py       ← Ablation B analysis
 │   ├── analyze_no_LR_ablation.py              ← Ablation C analysis
 │   │
-│   ├── generate_full_run_report.py            ← v1 internal technical report
-│   ├── generate_full_run_report_v2_consensus.py  ← v5 internal technical report (full provenance trail)
-│   ├── generate_full_run_responses_appendix.py   ← Appendix F: all 5,400 GPT responses
-│   ├── generate_full_run_responses_appendix_v2.py
-│   ├── gemini_rep1_analysis.py                ← Rep-1 Gemini analysis snapshot
-│   ├── gemini_rep1_report.py                  ← Rep-1 Gemini report snapshot
-│   ├── generate_DMFR_paper_v2.py              ← Build manuscript v2 from colleague's v1 draft
-│   ├── generate_DMFR_paper_v3.py              ← Build manuscript v3 (Reviewer-2 audit pass)
-│   ├── fix_table8_format.py                   ← Format Table 8 to match colleague's Table 6 style
-│   │
-│   ├── audit_v5_numerical.py                  ← internal report cell-by-cell verification
-│   ├── audit_v5_comprehensive.py              ← internal report sign-convention / consistency
-│   ├── audit_from_raw.py                      ← re-derive every key number from raw JSONLs
-│   └── audit_appendices_raw.py                ← Appendix F + G cells vs raw JSONLs
+│   ├── v4_canonical_stats.py                  ← Canonical statistical pipeline (Table 2 / 3 / 4 / 5 from raw, with bootstrap 95 % CIs + Wilcoxon W⁺)
+│   ├── compute_S2_cis.py                      ← Bootstrap 95 % CIs for inter/intra-rater Cohen's κ and mean Jaccard / Dice
+│   ├── regen_fig3_v4.py                       ← Figure 3 (SDR@1 bar chart by modality)
+│   ├── regen_fig4_v4.py                       ← Figure 4 (Tooth_33_Apex prediction heatmap, GPT vs Gemini)
+│   └── regen_fig5_v4.py                       ← Figure 5 (GPT-5.4 per-landmark zero-shot vs guided rank-biserial r)
 │
 └── tests/
     └── smoke_e2e.py                           ← regression gate (parse → metrics → plots)
@@ -176,21 +167,31 @@ Total wall time for a 3-rep Gemini run: ≈ 1–4 h (Google's batch SLA is "with
 .venv/bin/python scripts/analyze_gpt_vs_gemini.py          # RQ7 cross-model
 .venv/bin/python scripts/analyze_gemini_vs_student.py      # RQ8
 
-# Audits: re-derive every cited number from raw JSONLs
-.venv/bin/python scripts/audit_from_raw.py
-.venv/bin/python scripts/audit_appendices_raw.py
-.venv/bin/python scripts/audit_v5_numerical.py
-.venv/bin/python scripts/audit_v5_comprehensive.py
+# Canonical recomputation (Tables 2/3/4/5 + bootstrap CIs + Wilcoxon W⁺)
+.venv/bin/python scripts/v4_canonical_stats.py
+.venv/bin/python scripts/compute_S2_cis.py
 ```
 
 All analyses are deterministic: bootstrap CIs use `random.Random(42)` so two clean runs produce byte-identical JSONs.
 
-### 6. Regenerate the manuscript
+### 6. Regenerate the published figures and statistical tables
 
 ```bash
-.venv/bin/python scripts/generate_DMFR_paper_v3.py
-# → docs/submission/DMFR_Grid_Study_v3.docx
+# All four scripts are deterministic (seed = 42 wired in)
+.venv/bin/python scripts/v4_canonical_stats.py     # → results_v4_canonical.json
+.venv/bin/python scripts/compute_S2_cis.py         # → results_v4_S2_cis.json
+.venv/bin/python scripts/regen_fig3_v4.py          # → fig3.png (SDR@1 bar chart)
+.venv/bin/python scripts/regen_fig4_v4.py          # → fig4.png (Tooth_33_Apex heatmap)
+.venv/bin/python scripts/regen_fig5_v4.py          # → fig5.png (GPT per-landmark r)
 ```
+
+`v4_canonical_stats.py` is the single canonical source for every numerical
+claim in the manuscript's Tables 2 (mean ED + SDR), 3 (GPT zero-shot vs
+guided per-landmark), 4 (model vs student) and 5 (cross-model). It loads
+raw `parsed_responses.json` from each repetition and the consensus pickle,
+recomputes every per-query metric, runs `scipy.stats.wilcoxon`, derives
+the rank-biserial r from W⁺/W⁻, and bootstraps 95 % CIs (10,000 resamples
+for means and Δ, 2,000 for r).
 
 ### 7. Smoke / regression gate
 
