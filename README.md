@@ -1,9 +1,9 @@
-# Companion code for the paper titled "*Comparative Analysis of Multimodal Large Language Models and Dental Students in Radiographic Anatomic Landmark Identification: A Novel Grid-Based Assessment Model*"
+# Companion code for the paper titled "*Multimodal Large Language Models and Dental Students in Radiographic Landmark Identification: A Novel Grid-Based Assessment*"
 
-This repository contains the complete code, statistical-analysis scripts, prompt templates and reproducibility infrastructure used in the manuscript (currently under review). It is intended both as supplementary material for reviewers and as a reusable benchmark framework for future MLLM spatial-reasoning studies in dental radiography.
+This repository contains the complete code, statistical-analysis scripts, prompt templates and reproducibility infrastructure used in the manuscript. It is intended as a reusable benchmark framework for future MLLM spatial-reasoning studies in dental radiography.
 
-> **Citation (placeholder — will be replaced on acceptance):**
-> Aydemir M.E. et al. *Comparative Analysis of Multimodal Large Language Models and Dental Students in Radiographic Anatomic Landmark Identification: A Novel Grid-Based Assessment Model.* (under review), 2026.
+> **Citation:**
+> Mehmet Egemen Aydemir, Burcu Sayin, Burcu Yeliz Kollayan, Can Günel, Kadir Cem, Mehmet Ali Gül. *Multimodal Large Language Models and Dental Students in Radiographic Landmark Identification: A Novel Grid-Based Assessment*. Dentomaxillofacial Radiology, August 2026. DOI: 10.1093/dmfr/twag060. https://doi.org/10.1093/dmfr/twag060 
 
 ## What this code does
 
@@ -14,7 +14,7 @@ Key methodological contributions implemented here:
 1. **Grid-based coordinate-response framework.** Each radiograph is overlaid with a per-modality grid (panoramic 16×8; periapical 8×6; cephalometric 10×8) rendered programmatically with cyan grid lines and yellow alphanumeric labels. Models and human raters return cell coordinates (e.g., `G10`). This collapses the localisation problem into a discrete classification task with built-in spatial discretisation, enabling apples-to-apples comparison across modalities and across MLLM/human respondents.
 2. **Provider-max image fidelity, byte-identical inputs.** GPT-5.4 (`detail = high`, ~2,275 image tokens) and Gemini 3.1 Pro (`mediaResolution = HIGH`, ~1,077 image tokens) receive the **same prompts** (byte-identity verified at orchestration time) on the **same image PNGs** (SHA-256-anchored). Any cross-model difference is attributable to the model itself, not to prompt or input drift.
 3. **Cryptographic reproducibility anchoring.** Every input file (200 PNG images, the source Excel, every raw JSONL/chunk output) is SHA-256-anchored. A `reproducibility_manifest.json` is regenerable from the source via `scripts/reproducibility_manifest.py` and verifies that nothing has drifted since the original run.
-4. **Pre-registered prompt-level ablations.** Three targeted ablations (FDI tooth-number removal; patient-frame disambiguation; lateralisation-clause removal) test wording-level explanations for a catastrophic Tooth_33_Apex regression; each had pre-specified decision criteria and 300 fresh API calls.
+4. **Pre-specified prompt-level ablations.** Three targeted ablations (FDI tooth-number removal; patient-frame disambiguation; lateralisation-clause removal) test wording-level explanations for a catastrophic Tooth_33_Apex regression; each had pre-specified decision criteria and 300 fresh API calls.
 5. **Cross-model paired Wilcoxon framework with Bonferroni correction.** All cross-model and AI-vs-human comparisons use paired non-parametric tests (justified by Shapiro–Wilk non-normality of paired differences, p < 10⁻⁶), with rank-biserial r as effect size, bootstrap 95% CIs, and Bonferroni correction within each comparison family.
 
 ## Repository layout
@@ -62,7 +62,7 @@ Key methodological contributions implemented here:
 │   ├── analyze_gpt_vs_student.py              ← RQ5: GPT vs students, paired Wilcoxon + Bland-Altman
 │   ├── analyze_gpt_vs_gemini.py               ← RQ7: cross-model paired Wilcoxon + F5/F6 attractor
 │   ├── analyze_gemini_vs_student.py           ← RQ8: Gemini vs students, paired Wilcoxon
-│   ├── analyze_fdi_ablation.py                ← Ablation A analysis + pre-registered verdict
+│   ├── analyze_fdi_ablation.py                ← Ablation A analysis + pre-specified verdict
 │   ├── analyze_patient_left_ablation.py       ← Ablation B analysis
 │   ├── analyze_no_LR_ablation.py              ← Ablation C analysis
 │   │
